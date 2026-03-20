@@ -4,9 +4,10 @@ Two-way Slack channel for Claude Code — chat from Slack DMs and channels, just
 
 The first `claude/channel` implementation for Slack. Uses Socket Mode (outbound WebSocket, no public URL) to bridge Slack messages into a running Claude Code session via MCP stdio. Five defense layers prevent prompt injection, token exfiltration, and unauthorized access. Three runtime options: Bun, Node.js, Docker.
 
+[![CI](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml/badge.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/blob/main/LICENSE)
 
-**Links:** [GitHub](https://github.com/jeremylongshore/claude-code-slack-channel)
+**Links:** [GitHub](https://github.com/jeremylongshore/claude-code-slack-channel) · [Pages](https://jeremylongshore.github.io/claude-code-slack-channel/)
 
 ---
 
@@ -63,7 +64,7 @@ claude-code-slack-channel is a fully built, single-file MCP server that bridges 
 
 The security architecture is the most substantial part of the design. Every inbound message passes through a gate function that checks sender identity against an allowlist before anything reaches the MCP notification layer. Outbound messages are similarly gated. State files (tokens, access config) are locked to 0o600 permissions with atomic writes. The system prompt explicitly warns Claude about prompt injection patterns.
 
-This is v0.1.0 — feature-complete for the core use case (DM chat + channel monitoring) but pre-release. No test suite yet. No CI pipeline. The immediate next step is real-world testing against a Slack workspace, then PR to `anthropics/claude-plugins-official`.
+This is v0.1.0 — feature-complete for the core use case (DM chat + channel monitoring) but pre-release. CI pipeline is configured and passing. No test suite yet. The immediate next step is real-world testing against a Slack workspace, then PR to `anthropics/claude-plugins-official`.
 
 ### Technology Stack
 
@@ -180,14 +181,14 @@ claude-code-slack-channel/
 
 #### Areas Needing Attention
 - **High** — No test suite. Core security functions (gate, assertSendable, assertOutboundAllowed) need unit tests before upstream PR.
-- **High** — No CI pipeline. Need GitHub Actions for typecheck + lint at minimum.
+- ~~**High** — No CI pipeline.~~ GitHub Actions CI configured (Bun typecheck). Passing.
 - **Medium** — Not yet tested against a real Slack workspace. Socket Mode connection, event flow, and file upload need live verification.
 - **Low** — No lint/format config (biome or eslint). Should add before upstream PR.
 
 ### Quick Reference
 
 - **Repo:** https://github.com/jeremylongshore/claude-code-slack-channel
-- **CI:** Not configured
+- **CI:** Passing (GitHub Actions — Bun typecheck)
 - **License:** Apache-2.0
 - **Last Release:** v0.1.0 (2026-03-20)
 - **Test Coverage:** None yet
