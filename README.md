@@ -118,6 +118,11 @@ claude --dangerously-load-development-channels server:slack
 
 [Full project one-pager and operator-grade system analysis](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53)
 
+## Contributors
+
+- [@jeremylongshore](https://github.com/jeremylongshore) — author
+- [@maui-99](https://github.com/maui-99) — security hardening (v0.3.0)
+
 ## License
 
 MIT
