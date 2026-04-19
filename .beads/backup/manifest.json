@@ -1,14 +1,14 @@
 {
   "format": "bd-backup-git-manifest-v1",
   "bd_version": "0.62.0",
-  "snapshot_timestamp": "2026-04-19T21:01:14.707560065Z",
-  "last_dolt_commit": "o3d81rh80ei4t4gci6m71e2oat4crotb",
+  "snapshot_timestamp": "2026-04-19T21:13:28.270469309Z",
+  "last_dolt_commit": "auuf8bj62cqsckphe7ppuil7imalufkp",
   "counts": {
-    "issues": 159,
-    "events": 667,
+    "issues": 162,
+    "events": 678,
     "comments": 0,
     "dependencies": 145,
-    "labels": 295,
+    "labels": 298,
     "config": 11
   }
 }
