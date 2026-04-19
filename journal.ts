@@ -462,12 +462,19 @@ export class JournalWriter {
     // token into one of those is a caller bug, not a redactor gap.
     const redactedInput = redactEventFields(input)
 
+    // Truncate AFTER redaction so a half-truncated token never appears
+    // on disk (audit-journal-architecture.md §206). Hard-cap per field
+    // at TRUNCATION_LIMIT_DEFAULT; an over-limit string becomes a
+    // marker + gets a sibling `<field>.len` entry so forensics can see
+    // the original size without reading the raw payload.
+    const truncatedInput = truncateEventFields(redactedInput)
+
     const partial: PartialJournalEvent = {
       v: 1,
       ts: this.now().toISOString(),
       seq: this.nextSeq,
       prevHash: this.lastHash,
-      ...redactedInput,
+      ...truncatedInput,
     }
     const hash = sha256Hex(this.lastHash + canonicalJson(partial))
     const event: JournalEvent = { ...partial, hash }
@@ -563,11 +570,10 @@ export function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) {
     return '[' + value.map(canonicalJson).join(',') + ']'
   }
-  if (typeof value === 'object') {
-    const obj = value as Record<string, unknown>
-    const keys = Object.keys(obj).sort()
+  if (isRecord(value)) {
+    const keys = Object.keys(value).sort()
     const pairs = keys.map(
-      (k) => JSON.stringify(k) + ':' + canonicalJson(obj[k]),
+      (k) => JSON.stringify(k) + ':' + canonicalJson(value[k]),
     )
     return '{' + pairs.join(',') + '}'
   }
@@ -584,6 +590,16 @@ export function canonicalJson(value: unknown): string {
  *  in this module share one implementation. */
 export function sha256Hex(input: string | Uint8Array): string {
   return createHash('sha256').update(input).digest('hex')
+}
+
+/** Narrow `value` to a plain object shape. Rejects arrays, null, and
+ *  primitives. Used by `canonicalJson`, `redact`, and `truncate` so
+ *  the `value as Record<string, unknown>` casts that previously
+ *  followed `typeof value === 'object' && value !== null` become
+ *  compiler-checked narrowings instead of trust-me-bro assertions.
+ *  Not exported — these helpers are the only callers. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -651,15 +667,14 @@ export function redact(value: unknown): unknown {
     }
     return changed ? out : value
   }
-  if (typeof value === 'object' && value !== null) {
+  if (isRecord(value)) {
     // Plain object fast-path. We do not try to detect class instances
     // here because the journal event shape is JSON — class instances
     // round-tripping through JSON.stringify would have lost their
     // prototype anyway.
-    const obj = value as Record<string, unknown>
     let changed = false
     const out: Record<string, unknown> = {}
-    for (const [k, v] of Object.entries(obj)) {
+    for (const [k, v] of Object.entries(value)) {
       const next = redact(v)
       if (next !== v) changed = true
       out[k] = next
@@ -693,6 +708,122 @@ export function redactEventFields(input: WriteInput): WriteInput {
   }
   if (hasInput) {
     out.input = redact(input.input) as Record<string, unknown>
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// Truncation — bound journal record size (ccsc-5pi.5)
+// ---------------------------------------------------------------------------
+
+/** Per-field character cap for journal records. Strings longer than
+ *  this get replaced with the truncation marker form:
+ *
+ *    `<first TRUNCATION_LIMIT_DEFAULT chars>[... truncated N chars]`
+ *
+ *  2048 chars is the doc-specified default (audit-journal-architecture.md
+ *  §200-210). Large enough to capture structured JSON error bodies and
+ *  typical tool-call args; small enough to keep the journal bounded
+ *  even under a burst of oversized payloads. */
+export const TRUNCATION_LIMIT_DEFAULT = 2048
+
+/** Truncate a single string to `max` characters, returning it unchanged
+ *  if already short enough. The marker preserves the original length
+ *  inline so a reader can tell the payload was oversized without
+ *  needing the sibling-field bookkeeping. */
+function truncateString(s: string, max: number): string {
+  if (s.length <= max) return s
+  const omitted = s.length - max
+  return `${s.slice(0, max)}[... truncated ${omitted} chars]`
+}
+
+/** Deep-walk `value`, bounding every string to `max` characters. For
+ *  object keys whose value was truncated, a sibling `<key>.len` entry
+ *  is added at the same object level recording the original character
+ *  count. The sibling key pattern matches audit-journal-architecture.md
+ *  §208-210. Arrays are walked but do not get sibling length entries
+ *  (arrays don't have named keys — the truncation marker itself
+ *  carries the size signal in that case).
+ *
+ *  Pure: returns the same reference when nothing was truncated.
+ *
+ *  Edge cases:
+ *    - If a sibling `<key>.len` key already exists on the object, it
+ *      is overwritten. Collisions with real data are not expected —
+ *      callers don't put dotted keys in event payloads — and silent
+ *      overwrite is preferable to a throw in the hot path.
+ *    - Non-string primitives (numbers, booleans, null) pass through.
+ *    - Unsupported container types (Maps, Sets, class instances) pass
+ *      through by reference. Pre-flatten those at the caller. */
+export function truncate(
+  value: unknown,
+  max: number = TRUNCATION_LIMIT_DEFAULT,
+): unknown {
+  if (typeof value === 'string') {
+    const t = truncateString(value, max)
+    return t === value ? value : t
+  }
+  if (Array.isArray(value)) {
+    let changed = false
+    const out: unknown[] = new Array(value.length)
+    for (let i = 0; i < value.length; i++) {
+      const next = truncate(value[i], max)
+      if (next !== value[i]) changed = true
+      out[i] = next
+    }
+    return changed ? out : value
+  }
+  if (isRecord(value)) {
+    const entries = Object.entries(value)
+    let changed = false
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of entries) {
+      if (typeof v === 'string' && v.length > max) {
+        out[k] = truncateString(v, max)
+        out[`${k}.len`] = v.length
+        changed = true
+      } else {
+        const next = truncate(v, max)
+        if (next !== v) changed = true
+        out[k] = next
+      }
+    }
+    return changed ? out : value
+  }
+  return value
+}
+
+/** Writer-integration helper. Mirrors `redactEventFields`: truncates
+ *  only `input` and `reason`, leaves everything else untouched. Called
+ *  by the writer after redaction so the hash is computed over the
+ *  bounded form.
+ *
+ *  Why scope it? `reason` and `input` are the realistic oversized-
+ *  payload surfaces; other fields are short identifiers. Truncating
+ *  `toolName` or `ruleId` would be more confusing than helpful. A
+ *  pathological caller who stuffs 100 KiB into `correlationId` will
+ *  surface that loudly rather than being quietly truncated — which
+ *  matches the redaction policy on the same fields. */
+export function truncateEventFields(
+  input: WriteInput,
+  max: number = TRUNCATION_LIMIT_DEFAULT,
+): WriteInput {
+  const hasReason = typeof input.reason === 'string'
+  const hasInput = input.input !== undefined
+
+  if (!hasReason && !hasInput) return input
+
+  const out: WriteInput = { ...input }
+  if (hasReason) {
+    const original = input.reason as string
+    // `reason` is a top-level string field governed by the strict
+    // JournalEvent schema; we cannot add a sibling `reason.len` key
+    // there (the schema would reject it). For this field the marker
+    // itself carries the original-length signal inline.
+    out.reason = truncateString(original, max)
+  }
+  if (hasInput) {
+    out.input = truncate(input.input, max) as Record<string, unknown>
   }
   return out
 }
