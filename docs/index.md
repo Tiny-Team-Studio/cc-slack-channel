@@ -1,4 +1,4 @@
-# claude-code-slack-channel v0.3.1
+# claude-code-slack-channel v0.4.0
 
 Two-way Slack channel for the Claude Code — chat from Slack DMs and channels, approve tool calls from your phone.
 
@@ -8,7 +8,7 @@ A `claude/channel` implementation for Slack. Uses Socket Mode (outbound WebSocke
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/jeremylongshore/claude-code-slack-channel/blob/main/LICENSE)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jeremylongshore/claude-code-slack-channel/badge)](https://scorecard.dev/viewer/?uri=github.com/jeremylongshore/claude-code-slack-channel)
 
-**Links:** [GitHub](https://github.com/jeremylongshore/claude-code-slack-channel) · [Gist One-Pager](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53) · [Release Notes](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.3.1)
+**Links:** [GitHub](https://github.com/jeremylongshore/claude-code-slack-channel) · [Gist One-Pager](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53) · [Release Notes](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.4.0)
 
 ---
 
@@ -63,9 +63,11 @@ Security is defense-in-depth: inbound gate drops ungated messages before MCP, ou
 
 claude-code-slack-channel is a production-oriented MCP server that bridges Slack workspaces to Claude Code sessions. The implementation is split across `server.ts` (~1000 lines of stateful runtime wiring) and `lib.ts` (~460 lines of pure, testable functions). Two skill files handle configuration and access management. Four dependencies (`@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`, `zod`) — no frameworks, no middleware, no build step for Bun.
 
+**v0.4.0** adds per-channel cross-bot message delivery via `allowBotIds` (#33 — @CaseyMargell). Multi-agent coordination: channels can opt in to receiving messages from specific peer bots (e.g., ops-monitor and engineering bots in `#incidents`). Default-safe — absent or empty `allowBotIds` preserves the "all bot messages dropped" behavior. Self-echo detection uses a triple-check (`bot_id`, `bot_profile.app_id`, `user`) to cover Slack payload variants. The test suite grew to 104 tests.
+
 **v0.3.1** is a patch release with two community bug fixes: clean MCP server shutdown on client disconnect (#7 — @jinsung-kang) and deduplication of dual-fire events when a message is both a `message` and `app_mention` (#8 — @CaseyMargell). The release also lands governance scaffolding (CODEOWNERS, SECURITY.md, CONTRIBUTING.md), Gemini PR review, CodeQL, and OpenSSF Scorecard.
 
-**v0.3.0** hardened the security model via a seven-vulnerability review from @maui-99: restrictive file sendable policy with symlink resolution, outbound gate enforcement on all reply paths, display-name sanitization against prompt injection, atomic `access.json` writes with 0o600, Slack file URL validation, and frozen-lockfile dependency pinning. The test suite grew from 52 to 86 tests in v0.3.0, then to 95 tests in v0.3.1.
+**v0.3.0** hardened the security model via a seven-vulnerability review from @maui-99: restrictive file sendable policy with symlink resolution, outbound gate enforcement on all reply paths, display-name sanitization against prompt injection, atomic `access.json` writes with 0o600, Slack file URL validation, and frozen-lockfile dependency pinning. The test suite grew from 52 to 86 tests in v0.3.0, then to 95 tests in v0.3.1, then to 104 tests in v0.4.0.
 
 ### Technology Stack
 
@@ -137,8 +139,8 @@ Socket Mode means **no public URL needed** — works behind firewalls, NAT, anyw
 - **Repo:** [github.com/jeremylongshore/claude-code-slack-channel](https://github.com/jeremylongshore/claude-code-slack-channel)
 - **CI:** Passing (GitHub Actions — typecheck, test, CodeQL, Gemini review, Scorecard)
 - **License:** MIT
-- **Latest Release:** [v0.3.1](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.3.1) (2026-04-15)
-- **Test Coverage:** 95 tests covering security-critical functions
+- **Latest Release:** [v0.4.0](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.4.0) (2026-04-18)
+- **Test Coverage:** 104 tests covering security-critical functions
 - **Docs:** [Anthropic Channels Reference](https://docs.anthropic.com/en/docs/claude-code/channels) · [Plugin Spec](https://docs.anthropic.com/en/docs/claude-code/plugins)
 
 ### Contributors
@@ -146,4 +148,4 @@ Socket Mode means **no public URL needed** — works behind firewalls, NAT, anyw
 - [@jeremylongshore](https://github.com/jeremylongshore) — author, maintainer
 - [@maui-99](https://github.com/maui-99) — security hardening review (v0.3.0, 7 vulnerabilities closed)
 - [@jinsung-kang](https://github.com/jinsung-kang) — clean shutdown on client disconnect (v0.3.1, #7)
-- [@CaseyMargell](https://github.com/CaseyMargell) — event deduplication fix (v0.3.1, #8)
+- [@CaseyMargell](https://github.com/CaseyMargell) — event deduplication fix (v0.3.1, #8), cross-bot delivery via `allowBotIds` (v0.4.0, #33)

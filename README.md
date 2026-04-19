@@ -1,4 +1,4 @@
-# claude-code-slack-channel v0.3.1
+# claude-code-slack-channel v0.4.0
 
 Two-way Slack ↔ Claude Code bridge. Chat with Claude from Slack DMs and channels, just like you'd chat in the terminal.
 
@@ -6,7 +6,7 @@ Two-way Slack ↔ Claude Code bridge. Chat with Claude from Slack DMs and channe
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jeremylongshore/claude-code-slack-channel/badge)](https://scorecard.dev/viewer/?uri=github.com/jeremylongshore/claude-code-slack-channel)
 
-**Links:** [Gist One-Pager](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53) · [GitHub Pages](https://jeremylongshore.github.io/claude-code-slack-channel/) · [Release Notes](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.3.1)
+**Links:** [Gist One-Pager](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53) · [GitHub Pages](https://jeremylongshore.github.io/claude-code-slack-channel/) · [Release Notes](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.4.0)
 
 > **Research Preview** — Channels require Claude Code v2.1.80+ and `claude.ai` login.
 
@@ -146,7 +146,7 @@ claude --dangerously-load-development-channels server:slack
 - [@jeremylongshore](https://github.com/jeremylongshore) — author, maintainer
 - [@maui-99](https://github.com/maui-99) — security hardening review (v0.3.0)
 - [@jinsung-kang](https://github.com/jinsung-kang) — clean shutdown on client disconnect (v0.3.1)
-- [@CaseyMargell](https://github.com/CaseyMargell) — event deduplication fix (v0.3.1)
+- [@CaseyMargell](https://github.com/CaseyMargell) — event deduplication fix (v0.3.1), cross-bot delivery via `allowBotIds` (v0.4.0)
 
 ## License
 
