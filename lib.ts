@@ -9,8 +9,8 @@
  */
 
 import { resolve, sep, basename, join } from 'path'
-import { realpathSync, mkdirSync } from 'fs'
-import { writeFile, chmod, rename, unlink } from 'fs/promises'
+import { realpathSync, mkdirSync, readdirSync, statSync, existsSync } from 'fs'
+import { writeFile, chmod, rename, unlink, readFile } from 'fs/promises'
 
 // ---------------------------------------------------------------------------
 // Constants (re-exported so server.ts and tests share the same values)
@@ -257,6 +257,140 @@ export async function saveSession(path: string, session: Session): Promise<void>
     }
     throw err
   }
+}
+
+/** Read and parse a session file, fail-closed on any containment breach.
+ *
+ *  Contract (000-docs/session-state-machine.md §47-68, §232-239):
+ *
+ *  - `path` is assumed to be the output of `sessionPath()` from a prior
+ *    turn. Between save and load, an adversary with local access could
+ *    replace the file with a symlink pointing outside the state root.
+ *    `loadSession` catches that by realpath-ing both the root and the
+ *    path and verifying root-prefix containment.
+ *  - Both `root` and `path` are realpath-resolved up front. Any
+ *    resolution failure (ENOENT on a missing file, loop, permission)
+ *    propagates to the caller — the supervisor treats that as a
+ *    `Quarantined` transition per the state machine.
+ *  - JSON.parse errors propagate unchanged. No silent recovery;
+ *    malformed session files are loud failures.
+ *
+ *  This function does NOT schema-validate the parsed object against the
+ *  `Session` shape. The writer (saveSession) is trusted to produce valid
+ *  content; runtime schema validation is a separate concern (a Zod
+ *  schema for Session would live with the type).
+ *
+ *  **Fail-closed posture.** Any throw here should drop the event (the
+ *  supervisor Quarantines the key); it must never degrade to a partial
+ *  load or a synthesized empty session.
+ */
+export async function loadSession(root: string, path: string): Promise<Session> {
+  const resolvedRoot = realpathSync.native(resolve(root))
+  // realpath on the file itself — throws ENOENT if missing, which is
+  // the caller's signal to create a fresh session. Also collapses any
+  // symlinks at `path` to their true target.
+  const resolvedFile = realpathSync.native(path)
+  if (!isUnderRoot(resolvedFile, resolvedRoot)) {
+    throw new Error(
+      `loadSession: resolved path escapes state root: ${JSON.stringify(path)}`,
+    )
+  }
+  const raw = await readFile(resolvedFile, 'utf8')
+  return JSON.parse(raw) as Session
+}
+
+/** Filename used as the thread-slot for migrated pre-0.5.0 session files.
+ *  Sessions whose original files used the flat per-channel layout surface
+ *  as this synthetic "default" thread after migration. */
+export const MIGRATED_DEFAULT_THREAD = 'default'
+
+/** Sentinel the migrator drops after a successful pass so subsequent
+ *  boots skip the scan. Lives inside sessions/ next to the per-channel
+ *  dirs — that's the tree being migrated, so the marker travels with it
+ *  if an operator ever moves or backs up the state root. */
+const MIGRATED_MARKER = '.migrated'
+
+/** One-shot migrator from the v0.4.x flat layout
+ *    sessions/<channel>.json
+ *  to the v0.5.0 thread-scoped layout
+ *    sessions/<channel>/<thread>.json
+ *
+ *  The legacy file becomes the `default` thread (constant above) so
+ *  existing conversations continue across the upgrade without context
+ *  loss (see 000-docs/session-state-machine.md §71-81).
+ *
+ *  Semantics:
+ *    - Idempotent. A successful pass drops `sessions/.migrated`; later
+ *      calls no-op.
+ *    - If `sessions/` does not exist (fresh install), drops the marker
+ *      anyway so v0.5.0 never re-scans.
+ *    - If the per-channel directory already exists from a partial prior
+ *      migration, skips that channel rather than clobbering.
+ *    - Component validation on every channel name — a malformed legacy
+ *      file (`.` / `..` / path separators) is skipped and reported.
+ *    - Preserves file mode because `rename` does not touch it. The
+ *      legacy writer used 0o600; the post-migration file keeps 0o600.
+ *
+ *  Called by `server.ts` at bootstrap, before any session activity. Not
+ *  safe to call while the supervisor is running (races with active
+ *  writers). Designed for boot-time only.
+ */
+export async function migrateFlatSessions(
+  root: string,
+): Promise<{ migrated: string[]; skipped: string[]; alreadyDone: boolean }> {
+  const resolvedRoot = realpathSync.native(resolve(root))
+  const sessionsDir = join(resolvedRoot, 'sessions')
+
+  // No sessions dir at all — fresh install. Create it and drop the
+  // marker so v0.5.0 boots never re-scan.
+  if (!existsSync(sessionsDir)) {
+    mkdirSync(sessionsDir, { recursive: true, mode: 0o700 })
+    await writeFile(join(sessionsDir, MIGRATED_MARKER), '', { mode: 0o600 })
+    return { migrated: [], skipped: [], alreadyDone: false }
+  }
+
+  // Idempotence: marker present → we're done.
+  if (existsSync(join(sessionsDir, MIGRATED_MARKER))) {
+    return { migrated: [], skipped: [], alreadyDone: true }
+  }
+
+  const migrated: string[] = []
+  const skipped: string[] = []
+
+  for (const entry of readdirSync(sessionsDir)) {
+    // Only legacy flat files: sessions/*.json that is a regular file.
+    if (!entry.endsWith('.json')) continue
+    const full = join(sessionsDir, entry)
+    const st = statSync(full)
+    if (!st.isFile()) continue
+
+    const channel = entry.slice(0, -'.json'.length)
+
+    // Defense-in-depth: a legacy file could have any name. Reject
+    // anything we wouldn't accept in the new layout.
+    if (!isValidSessionComponent(channel)) {
+      skipped.push(entry)
+      continue
+    }
+
+    const channelDir = join(sessionsDir, channel)
+    const target = join(channelDir, `${MIGRATED_DEFAULT_THREAD}.json`)
+
+    // If the per-channel dir already exists from a partial prior
+    // migration (interrupted boot, manual poking), skip rather than
+    // clobber. Operator decides what to do with the stray legacy file.
+    if (existsSync(channelDir)) {
+      skipped.push(entry)
+      continue
+    }
+
+    mkdirSync(channelDir, { recursive: true, mode: 0o700 })
+    await rename(full, target)
+    migrated.push(channel)
+  }
+
+  await writeFile(join(sessionsDir, MIGRATED_MARKER), '', { mode: 0o600 })
+  return { migrated, skipped, alreadyDone: false }
 }
 
 // ---------------------------------------------------------------------------

@@ -14,6 +14,9 @@ import {
   isDuplicateEvent,
   sessionPath,
   saveSession,
+  loadSession,
+  migrateFlatSessions,
+  MIGRATED_DEFAULT_THREAD,
   EVENT_DEDUP_TTL_MS,
   PERMISSION_REPLY_RE,
   MAX_PENDING,
@@ -1285,5 +1288,342 @@ describe('saveSession', () => {
     const loaded = JSON.parse(readFileSync(p, 'utf8')) as Session
     expect(loaded.key.channel).toBe('C_ID')
     expect(loaded.key.thread).toBe('1700000000.000100')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// loadSession — realpath-guarded reader
+//
+// Entry point to on-disk state after a supervisor restart. Trusts nothing:
+// realpaths both root and target, verifies containment, fail-closed on any
+// resolution error. See 000-docs/session-state-machine.md §232-239 for the
+// restart-recovery contract this reader serves.
+// ---------------------------------------------------------------------------
+
+describe('loadSession', () => {
+  let rawRoot: string
+  let tmpRoot: string
+
+  const makeSession = (channel: string, thread: string): Session => ({
+    v: 1,
+    key: { channel, thread },
+    createdAt: 1_700_000_000_000,
+    lastActiveAt: 1_700_000_001_000,
+    ownerId: 'U_OWNER',
+    data: { turns: ['hello', 'world'] },
+  })
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'loadSession-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  test('round-trips with saveSession — load returns the saved object', async () => {
+    const key = { channel: 'C_RT', thread: '1700000000.000100' }
+    const p = sessionPath(tmpRoot, key)
+    const s = makeSession(key.channel, key.thread)
+
+    await saveSession(p, s)
+    const loaded = await loadSession(tmpRoot, p)
+
+    expect(loaded).toEqual(s)
+  })
+
+  test('throws ENOENT when file is missing', async () => {
+    const p = sessionPath(tmpRoot, { channel: 'C_MISS', thread: 'T1.0' })
+    // sessionPath created the per-channel dir but no file yet.
+    await expect(loadSession(tmpRoot, p)).rejects.toThrow()
+  })
+
+  test('rejects symlink at session file pointing outside the state root', async () => {
+    // Simulate an attacker who swaps the session file for a symlink
+    // to an arbitrary path after save. loadSession realpaths and
+    // checks the resolved target is still under the state root.
+    const outside = mkdtempSync(join(tmpdir(), 'loadSession-escape-'))
+    const victimFile = join(outside, 'victim.json')
+    writeFileSync(victimFile, JSON.stringify(makeSession('C_EVIL', 'T1.0')))
+
+    try {
+      const p = sessionPath(tmpRoot, { channel: 'C_EVIL', thread: 'T1.0' })
+      // Place a symlink at the session-file path pointing outside root.
+      symlinkSync(victimFile, p)
+
+      await expect(loadSession(tmpRoot, p)).rejects.toThrow(/escapes state root/)
+    } finally {
+      rmSync(outside, { recursive: true, force: true })
+    }
+  })
+
+  test('throws on malformed JSON — no silent recovery', async () => {
+    const p = sessionPath(tmpRoot, { channel: 'C_BAD', thread: 'T1.0' })
+    writeFileSync(p, '{not valid json', { mode: 0o600 })
+
+    await expect(loadSession(tmpRoot, p)).rejects.toThrow()
+  })
+
+  test('round-trip preserves nested data field contents', async () => {
+    const key = { channel: 'C_NEST', thread: 'T1.0' }
+    const p = sessionPath(tmpRoot, key)
+    const s = makeSession(key.channel, key.thread)
+    s.data = {
+      turns: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'hi back' },
+      ],
+      counters: { messages: 2, replies: 1 },
+    }
+
+    await saveSession(p, s)
+    const loaded = await loadSession(tmpRoot, p)
+
+    expect(loaded.data).toEqual(s.data)
+  })
+
+  test('two threads in one channel round-trip independently', async () => {
+    // Locks the core session-isolation invariant end-to-end: save thread A,
+    // save thread B, load both, neither sees the other's state.
+    const pA = sessionPath(tmpRoot, { channel: 'C_ISO', thread: 'TA.0' })
+    const pB = sessionPath(tmpRoot, { channel: 'C_ISO', thread: 'TB.0' })
+
+    const sA = makeSession('C_ISO', 'TA.0')
+    sA.ownerId = 'U_A'
+    const sB = makeSession('C_ISO', 'TB.0')
+    sB.ownerId = 'U_B'
+
+    await saveSession(pA, sA)
+    await saveSession(pB, sB)
+
+    const loadedA = await loadSession(tmpRoot, pA)
+    const loadedB = await loadSession(tmpRoot, pB)
+
+    expect(loadedA.ownerId).toBe('U_A')
+    expect(loadedB.ownerId).toBe('U_B')
+    expect(loadedA.key.thread).toBe('TA.0')
+    expect(loadedB.key.thread).toBe('TB.0')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// migrateFlatSessions — 000-docs/session-state-machine.md §71-81
+//
+// One-shot boot-time migration from flat pre-0.5.0 layout
+// (sessions/<channel>.json) to thread-scoped layout
+// (sessions/<channel>/default.json). Idempotent via .migrated marker.
+// ---------------------------------------------------------------------------
+
+describe('migrateFlatSessions', () => {
+  let rawRoot: string
+  let tmpRoot: string
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'migrate-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  const writeLegacy = (channel: string, payload: unknown): void => {
+    const sessionsDir = join(tmpRoot, 'sessions')
+    mkdirSync(sessionsDir, { recursive: true, mode: 0o700 })
+    writeFileSync(join(sessionsDir, `${channel}.json`), JSON.stringify(payload), {
+      mode: 0o600,
+    })
+  }
+
+  test('migrates a single legacy file to <channel>/default.json', async () => {
+    const legacyBody = { v: 1, legacy: 'pre-0.5.0 content' }
+    writeLegacy('C_LEG', legacyBody)
+
+    const result = await migrateFlatSessions(tmpRoot)
+
+    expect(result.migrated).toEqual(['C_LEG'])
+    expect(result.alreadyDone).toBe(false)
+
+    const newPath = join(tmpRoot, 'sessions', 'C_LEG', `${MIGRATED_DEFAULT_THREAD}.json`)
+    expect(existsSync(newPath)).toBe(true)
+    expect(JSON.parse(readFileSync(newPath, 'utf8'))).toEqual(legacyBody)
+
+    // Legacy flat file removed.
+    expect(existsSync(join(tmpRoot, 'sessions', 'C_LEG.json'))).toBe(false)
+  })
+
+  test('preserves file mode 0o600 across rename', async () => {
+    writeLegacy('C_MODE', { v: 1 })
+    await migrateFlatSessions(tmpRoot)
+
+    const newPath = join(tmpRoot, 'sessions', 'C_MODE', `${MIGRATED_DEFAULT_THREAD}.json`)
+    const st = statSync(newPath)
+    expect(st.mode & 0o777).toBe(0o600)
+  })
+
+  test('is idempotent — second call is a no-op', async () => {
+    writeLegacy('C_IDEM', { v: 1 })
+    const first = await migrateFlatSessions(tmpRoot)
+    expect(first.migrated).toEqual(['C_IDEM'])
+
+    const second = await migrateFlatSessions(tmpRoot)
+    expect(second.alreadyDone).toBe(true)
+    expect(second.migrated).toEqual([])
+  })
+
+  test('drops marker even on fresh-install (sessions/ did not exist)', async () => {
+    const result = await migrateFlatSessions(tmpRoot)
+    expect(result.migrated).toEqual([])
+    expect(result.alreadyDone).toBe(false)
+    expect(existsSync(join(tmpRoot, 'sessions', '.migrated'))).toBe(true)
+  })
+
+  test('skips legacy filenames with invalid components (defense in depth)', async () => {
+    mkdirSync(join(tmpRoot, 'sessions'), { recursive: true, mode: 0o700 })
+    // ".." is a legacy filename that would migrate to sessions/../default.json
+    // — exactly the lexical-escape we added a guard for in sessionPath.
+    writeFileSync(join(tmpRoot, 'sessions', '...json'), 'x')
+
+    const result = await migrateFlatSessions(tmpRoot)
+    expect(result.migrated).toEqual([])
+    // The entry "...json" has channel "..", rejected by isValidSessionComponent.
+    expect(result.skipped).toEqual(['...json'])
+  })
+
+  test('skips channels whose target per-channel dir already exists', async () => {
+    // Partial prior migration: the new-layout dir was created but the
+    // legacy file was not yet removed. Don't clobber — operator triage.
+    writeLegacy('C_PART', { v: 1 })
+    mkdirSync(join(tmpRoot, 'sessions', 'C_PART'), { recursive: true, mode: 0o700 })
+
+    const result = await migrateFlatSessions(tmpRoot)
+    expect(result.migrated).toEqual([])
+    expect(result.skipped).toEqual(['C_PART.json'])
+    // Legacy file left in place so the operator can see both.
+    expect(existsSync(join(tmpRoot, 'sessions', 'C_PART.json'))).toBe(true)
+  })
+
+  test('migrates multiple channels in one pass', async () => {
+    writeLegacy('C_A', { v: 1, owner: 'a' })
+    writeLegacy('C_B', { v: 1, owner: 'b' })
+    writeLegacy('C_C', { v: 1, owner: 'c' })
+
+    const result = await migrateFlatSessions(tmpRoot)
+    expect(result.migrated.sort()).toEqual(['C_A', 'C_B', 'C_C'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Integration — ccsc-z78.8: state survives process restart under both
+// layouts. Composes migrateFlatSessions, sessionPath, saveSession, and
+// loadSession to prove the full boot → work → restart → resume flow.
+// ---------------------------------------------------------------------------
+
+describe('session persistence across restart', () => {
+  let rawRoot: string
+  let tmpRoot: string
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'restart-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  test('legacy layout → migrate → restart → load returns original content', async () => {
+    // Simulate a v0.4.x state dir with a flat session file.
+    const legacyPayload: Session = {
+      v: 1,
+      key: { channel: 'C_OLD', thread: MIGRATED_DEFAULT_THREAD },
+      createdAt: 1_700_000_000_000,
+      lastActiveAt: 1_700_000_500_000,
+      ownerId: 'U_PREUPGRADE',
+      data: { history: ['q1', 'a1', 'q2'] },
+    }
+    const sessionsDir = join(tmpRoot, 'sessions')
+    mkdirSync(sessionsDir, { recursive: true, mode: 0o700 })
+    writeFileSync(join(sessionsDir, 'C_OLD.json'), JSON.stringify(legacyPayload), {
+      mode: 0o600,
+    })
+
+    // Boot v0.5.0: migrator runs once.
+    await migrateFlatSessions(tmpRoot)
+
+    // "Restart": later boot recomputes path from key, loadSession reads.
+    const key: SessionKey = { channel: 'C_OLD', thread: MIGRATED_DEFAULT_THREAD }
+    const p = sessionPath(tmpRoot, key)
+    const loaded = await loadSession(tmpRoot, p)
+
+    expect(loaded).toEqual(legacyPayload)
+  })
+
+  test('new layout → save → restart → load returns original content', async () => {
+    const key: SessionKey = { channel: 'C_NEW', thread: '1700000000.000100' }
+    const s: Session = {
+      v: 1,
+      key,
+      createdAt: 1_700_000_000_000,
+      lastActiveAt: 1_700_000_100_000,
+      ownerId: 'U_OWNER',
+      data: { turns: ['one', 'two'] },
+    }
+
+    // Boot 1: ensure state dir, migrate (no-op), save the session.
+    await migrateFlatSessions(tmpRoot)
+    const p1 = sessionPath(tmpRoot, key)
+    await saveSession(p1, s)
+
+    // Boot 2: migrate is idempotent, sessionPath returns the same path
+    // (it just re-mkdirs the per-channel dir), load returns the session.
+    const migrated2 = await migrateFlatSessions(tmpRoot)
+    expect(migrated2.alreadyDone).toBe(true)
+
+    const p2 = sessionPath(tmpRoot, key)
+    expect(p2).toBe(p1)
+    const loaded = await loadSession(tmpRoot, p2)
+    expect(loaded).toEqual(s)
+  })
+
+  test('mixed: legacy file for one channel + new-layout file for another, both survive', async () => {
+    // Channel A: legacy file.
+    const legacy: Session = {
+      v: 1,
+      key: { channel: 'C_MIX_OLD', thread: MIGRATED_DEFAULT_THREAD },
+      createdAt: 1_700_000_000_000,
+      lastActiveAt: 1_700_000_000_000,
+      ownerId: 'U_A',
+      data: {},
+    }
+    const sessionsDir = join(tmpRoot, 'sessions')
+    mkdirSync(sessionsDir, { recursive: true, mode: 0o700 })
+    writeFileSync(join(sessionsDir, 'C_MIX_OLD.json'), JSON.stringify(legacy), {
+      mode: 0o600,
+    })
+
+    // Run migrator — legacy file becomes new-layout.
+    await migrateFlatSessions(tmpRoot)
+
+    // Channel B: new-layout save (post-migration).
+    const newKey: SessionKey = { channel: 'C_MIX_NEW', thread: 'T1.0' }
+    const newSession: Session = {
+      v: 1,
+      key: newKey,
+      createdAt: 1_700_000_100_000,
+      lastActiveAt: 1_700_000_100_000,
+      ownerId: 'U_B',
+      data: {},
+    }
+    const pNew = sessionPath(tmpRoot, newKey)
+    await saveSession(pNew, newSession)
+
+    // Restart: both survive.
+    const loadedOld = await loadSession(
+      tmpRoot,
+      sessionPath(tmpRoot, { channel: 'C_MIX_OLD', thread: MIGRATED_DEFAULT_THREAD }),
+    )
+    const loadedNew = await loadSession(tmpRoot, sessionPath(tmpRoot, newKey))
+
+    expect(loadedOld.ownerId).toBe('U_A')
+    expect(loadedNew.ownerId).toBe('U_B')
   })
 })
