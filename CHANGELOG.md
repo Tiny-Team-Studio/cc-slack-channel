@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-04-19
+
+### Added
+
+- **Per-channel `audit` field on ChannelPolicy** (#105) — operators configure audit projection behavior per channel: `'off'` (default, no Slack posts), `'compact'` (tool name + outcome only), or `'full'` (includes redacted input preview). The authoritative audit log (`~/.claude/channels/slack/audit.log`) is unaffected by this setting — it always records all events.
+- **Pre-execution audit receipts projected to Slack threads** (#106) — when `audit` is `'compact'` or `'full'`, the server posts a receipt to the originating thread before tool execution. Receipt includes tool name, decision (`policy.allow`/`policy.deny`/`policy.require`/`policy.approved`), and (in full mode) a redacted input preview. Self-echoes of these receipts are dropped by the inbound gate's triple-check.
+- **auditReceipts map capped at 500 entries** (#110) — memory safety guard prevents unbounded growth of the `ts → eventId` tracking map used for self-echo detection. Oldest entries evicted on overflow.
+
+### Changed
+
+- **Documentation**: clarified the distinction between the authoritative audit log (hash-chained, local, always-on) and the Slack projection (best-effort, per-channel opt-in). Updated CLAUDE.md and added `000-docs/audit-journal-architecture.md` section on projection semantics (#109).
+
+### Tests
+
+- Gate self-echo regression test for audit receipts (#108) — ensures projected receipts don't re-enter the message pipeline even when the channel has `allowBotIds` configured.
+- `audit:off` produces zero Slack messages test (#107) — validates that the default `audit: 'off'` setting results in no projection posts.
+
 ## [0.6.0] - 2026-04-20
 
 ### Added
