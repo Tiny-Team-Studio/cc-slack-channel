@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Pre-commit quality gate via Husky + lint-staged** (`ccsc-rrj`). Local `.husky/pre-commit` runs `bunx @biomejs/biome check --write` on staged TS/JS/JSON files; `.husky/pre-push` runs `tsc --noEmit` for cross-file guarantees. Both hooks preserve the beads integration block so `bd` sync keeps working after Husky takes over `core.hooksPath`. `prepare: husky` script in `package.json` auto-installs hooks on `bun install`.
+- **Property-based tests for `gate()`** (`ccsc-363`). New `features/gate-properties.test.ts` uses `fast-check` to assert 11 invariants across the inbound-gate input space: self-echo drops (3 identifier paths), bot opt-in requirements (allowBotIds presence + match + permission-reply blocking), no-user drops, non-file-share subtype drops, DM allowlist behavior, and channel-gate behavior. Each property runs 200 random inputs. Adds 13 tests / 2,600 assertions to the suite. Safety net for the upcoming `ccsc-u41` `gate()` refactor — catches edge cases specific test cases cannot.
+
 ## [0.8.0] - 2026-04-21
 
 ### Added
