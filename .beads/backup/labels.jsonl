@@ -41,6 +41,8 @@
 {"issue_id":"ccsc-3fo","label":"release:v0.5.1"}
 {"issue_id":"ccsc-4an","label":"release:v0.6.0"}
 {"issue_id":"ccsc-4nm","label":"release:v0.7.x"}
+{"issue_id":"ccsc-53g","label":"audit-integrity"}
+{"issue_id":"ccsc-53g","label":"wall5"}
 {"issue_id":"ccsc-5pi","label":"issue:#30"}
 {"issue_id":"ccsc-5pi","label":"release:v0.5.1"}
 {"issue_id":"ccsc-5pi.1","label":"issue:#30"}
@@ -75,6 +77,8 @@
 {"issue_id":"ccsc-5pi.8","label":"release:v0.4.1"}
 {"issue_id":"ccsc-5pi.9","label":"issue:#30"}
 {"issue_id":"ccsc-5pi.9","label":"release:v0.4.1"}
+{"issue_id":"ccsc-5vx","label":"audit-integrity"}
+{"issue_id":"ccsc-5vx","label":"wall7b"}
 {"issue_id":"ccsc-60i","label":"release:v0.5.1"}
 {"issue_id":"ccsc-67u","label":"release:v0.5.1"}
 {"issue_id":"ccsc-6j2","label":"release:v0.5.1"}
@@ -86,6 +90,8 @@
 {"issue_id":"ccsc-9d9","label":"release:v0.5.1"}
 {"issue_id":"ccsc-a9z","label":"hardening"}
 {"issue_id":"ccsc-a9z","label":"security"}
+{"issue_id":"ccsc-ana","label":"audit-integrity"}
+{"issue_id":"ccsc-ana","label":"wall7b"}
 {"issue_id":"ccsc-bsz","label":"audit-integrity"}
 {"issue_id":"ccsc-bsz","label":"security"}
 {"issue_id":"ccsc-buo","label":"release:v0.5.1"}
