@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Refactor MCP tool dispatcher — extract per-tool handler functions** (`ccsc-lry`). The monolithic 655-line anonymous `switch` block inside `mcp.setRequestHandler(CallToolRequestSchema, …)` (cyclomatic complexity 84) has been replaced by eight named top-level async functions (`executeReply`, `executeReact`, `executeEditMessage`, `executeFetchMessages`, `executeDownloadAttachment`, `executeListSessions`, `executeReadPeerManifests`, `executePublishManifest`) plus four `executePublishManifestGateN` helpers and one `executePublishManifestReplace` helper. The dispatcher is now a Zod-validation block + lookup-then-call pattern wired through a `ToolContext` interface that bundles the closure state each handler needs. Complexity before/after: dispatcher 84 → 5; all extracted handlers ≤17 (max is `executeReply` at 17). No behavior changes; all 682 tests pass, coverage 98.39% / 98.75%.
+
 ### Added
 
 - **Pre-commit quality gate via Husky + lint-staged** (`ccsc-rrj`). Local `.husky/pre-commit` runs `bunx @biomejs/biome check --write` on staged TS/JS/JSON files; `.husky/pre-push` runs `tsc --noEmit` for cross-file guarantees. Both hooks preserve the beads integration block so `bd` sync keeps working after Husky takes over `core.hooksPath`. `prepare: husky` script in `package.json` auto-installs hooks on `bun install`.

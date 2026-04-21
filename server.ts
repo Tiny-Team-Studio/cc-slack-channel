@@ -833,6 +833,726 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 // Tools — execution
 // ---------------------------------------------------------------------------
 
+/** Shared context passed to every per-tool handler. Bundles the
+ *  module-level dependencies each handler needs so the dispatcher can
+ *  call handlers without every one of them reaching into module scope
+ *  individually. Handlers must not mutate ctx fields. */
+interface ToolContext {
+  web: WebClient
+  botToken: string
+  assertOutboundAllowed: (chatId: string, threadTs: string | undefined) => void
+  assertSendable: (filePath: string) => void
+  journalWrite: (input: Parameters<import('./journal.ts').JournalWriter['writeEvent']>[0]) => void
+  getAccess: () => import('./lib.ts').Access
+  resolveUserName: (userId: string) => Promise<string>
+  manifestCache: ReturnType<typeof createManifestCache>
+  publishRateLimiter: ReturnType<typeof createPublishRateLimiter>
+  selfBotId: string
+  botUserId: string
+  STATE_DIR: string
+  INBOX_DIR: string
+  DEFAULT_CHUNK_LIMIT: number
+}
+
+/** Canonical return shape for all tool handlers. */
+type ToolResult = { content: Array<{ type: string; text: string }>; isError?: boolean }
+
+// ---------------------------------------------------------------------------
+// Per-tool handler functions
+// ---------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------
+// reply
+// -----------------------------------------------------------------------
+async function executeReply(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> {
+  const chatId: string = args.chat_id
+  const text: string = args.text
+  const threadTs: string | undefined = args.thread_ts
+  const files: string[] | undefined = args.files
+
+  try {
+    ctx.assertOutboundAllowed(chatId, threadTs)
+  } catch (outboundErr) {
+    ctx.journalWrite({
+      kind: 'gate.outbound.deny',
+      outcome: 'deny',
+      toolName: 'reply',
+      sessionKey: threadTs !== undefined ? { channel: chatId, thread: threadTs } : undefined,
+      input: { channel: chatId, thread_ts: threadTs },
+      reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+    })
+    throw outboundErr
+  }
+  ctx.journalWrite({
+    kind: 'gate.outbound.allow',
+    outcome: 'allow',
+    toolName: 'reply',
+    sessionKey: threadTs !== undefined ? { channel: chatId, thread: threadTs } : undefined,
+    input: { channel: chatId, thread_ts: threadTs },
+  })
+
+  const access = ctx.getAccess()
+  const limit = access.textChunkLimit || ctx.DEFAULT_CHUNK_LIMIT
+  const mode = access.chunkMode || 'newline'
+  const chunks = chunkText(text, limit, mode)
+
+  let lastTs = ''
+  for (const chunk of chunks) {
+    const res = await ctx.web.chat.postMessage({
+      channel: chatId,
+      text: chunk,
+      thread_ts: threadTs,
+      unfurl_links: false,
+      unfurl_media: false,
+    })
+    lastTs = (res.ts as string) || lastTs
+  }
+
+  // Upload files if provided
+  if (files && files.length > 0) {
+    for (const filePath of files) {
+      try {
+        ctx.assertSendable(filePath)
+      } catch (exfilErr) {
+        ctx.journalWrite({
+          kind: 'exfil.block',
+          outcome: 'deny',
+          toolName: 'reply',
+          reason: exfilErr instanceof Error ? exfilErr.message : String(exfilErr),
+        })
+        throw exfilErr
+      }
+      const resolved = resolve(filePath)
+      const uploadArgs: Record<string, any> = {
+        channel_id: chatId,
+        file: resolved,
+      }
+      if (threadTs) uploadArgs.thread_ts = threadTs
+      await ctx.web.filesUploadV2(uploadArgs as any)
+    }
+  }
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `Sent ${chunks.length} message(s)${files?.length ? ` + ${files.length} file(s)` : ''} to ${chatId}${lastTs ? ` [ts: ${lastTs}]` : ''}`,
+      },
+    ],
+  }
+}
+
+// -----------------------------------------------------------------------
+// react
+// -----------------------------------------------------------------------
+async function executeReact(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> {
+  // react operates on a specific message ts; the "thread" it
+  // engages with is whatever thread that message lives in.
+  // Callers that know the parent thread pass `thread_ts`; when
+  // omitted, fall back to channel-level opt-in or top-level
+  // delivery by passing undefined.
+  try {
+    ctx.assertOutboundAllowed(args.chat_id, args.thread_ts)
+  } catch (outboundErr) {
+    ctx.journalWrite({
+      kind: 'gate.outbound.deny',
+      outcome: 'deny',
+      toolName: 'react',
+      sessionKey:
+        args.thread_ts !== undefined
+          ? { channel: args.chat_id, thread: args.thread_ts }
+          : undefined,
+      input: { channel: args.chat_id, thread_ts: args.thread_ts },
+      reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+    })
+    throw outboundErr
+  }
+  ctx.journalWrite({
+    kind: 'gate.outbound.allow',
+    outcome: 'allow',
+    toolName: 'react',
+    sessionKey:
+      args.thread_ts !== undefined ? { channel: args.chat_id, thread: args.thread_ts } : undefined,
+    input: { channel: args.chat_id, thread_ts: args.thread_ts },
+  })
+  await ctx.web.reactions.add({
+    channel: args.chat_id,
+    timestamp: args.message_id,
+    name: args.emoji,
+  })
+  return {
+    content: [{ type: 'text', text: `Reacted :${args.emoji}: to ${args.message_id}` }],
+  }
+}
+
+// -----------------------------------------------------------------------
+// edit_message
+// -----------------------------------------------------------------------
+async function executeEditMessage(
+  args: Record<string, any>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  // Editing a message engages with the thread that message lives
+  // in. Callers that know the thread pass `thread_ts`; otherwise
+  // the gate falls back to channel-level opt-in or top-level.
+  try {
+    ctx.assertOutboundAllowed(args.chat_id, args.thread_ts)
+  } catch (outboundErr) {
+    ctx.journalWrite({
+      kind: 'gate.outbound.deny',
+      outcome: 'deny',
+      toolName: 'edit_message',
+      sessionKey:
+        args.thread_ts !== undefined
+          ? { channel: args.chat_id, thread: args.thread_ts }
+          : undefined,
+      input: { channel: args.chat_id, thread_ts: args.thread_ts },
+      reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+    })
+    throw outboundErr
+  }
+  ctx.journalWrite({
+    kind: 'gate.outbound.allow',
+    outcome: 'allow',
+    toolName: 'edit_message',
+    sessionKey:
+      args.thread_ts !== undefined ? { channel: args.chat_id, thread: args.thread_ts } : undefined,
+    input: { channel: args.chat_id, thread_ts: args.thread_ts },
+  })
+  await ctx.web.chat.update({
+    channel: args.chat_id,
+    ts: args.message_id,
+    text: args.text,
+  })
+  return {
+    content: [{ type: 'text', text: `Edited message ${args.message_id}` }],
+  }
+}
+
+// -----------------------------------------------------------------------
+// fetch_messages
+// -----------------------------------------------------------------------
+async function executeFetchMessages(
+  args: Record<string, any>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const channel: string = args.channel
+  const threadTs: string | undefined = args.thread_ts
+  const limit = Math.min(args.limit || 20, 100)
+  try {
+    ctx.assertOutboundAllowed(channel, threadTs)
+  } catch (outboundErr) {
+    ctx.journalWrite({
+      kind: 'gate.outbound.deny',
+      outcome: 'deny',
+      toolName: 'fetch_messages',
+      sessionKey: threadTs !== undefined ? { channel, thread: threadTs } : undefined,
+      input: { channel, thread_ts: threadTs },
+      reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+    })
+    throw outboundErr
+  }
+  ctx.journalWrite({
+    kind: 'gate.outbound.allow',
+    outcome: 'allow',
+    toolName: 'fetch_messages',
+    sessionKey: threadTs !== undefined ? { channel, thread: threadTs } : undefined,
+    input: { channel, thread_ts: threadTs },
+  })
+
+  let messages: any[]
+  if (threadTs) {
+    const res = await ctx.web.conversations.replies({
+      channel,
+      ts: threadTs,
+      limit,
+    })
+    messages = res.messages || []
+  } else {
+    const res = await ctx.web.conversations.history({
+      channel,
+      limit,
+    })
+    messages = (res.messages || []).reverse() // oldest-first
+  }
+
+  const formatted = await Promise.all(
+    messages.map(async (m: any) => {
+      const userName = m.user ? await ctx.resolveUserName(m.user) : 'unknown'
+      return {
+        ts: m.ts,
+        user: userName,
+        user_id: m.user,
+        text: m.text,
+        thread_ts: m.thread_ts,
+        files: m.files?.map((f: any) => ({
+          name: f.name,
+          mimetype: f.mimetype,
+          size: f.size,
+        })),
+      }
+    }),
+  )
+
+  return {
+    content: [{ type: 'text', text: JSON.stringify(formatted, null, 2) }],
+  }
+}
+
+// -----------------------------------------------------------------------
+// download_attachment
+// -----------------------------------------------------------------------
+async function executeDownloadAttachment(
+  args: Record<string, any>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const channel: string = args.chat_id
+  const messageTs: string = args.message_id
+
+  // Download engages with the thread the target message lives
+  // in. Callers that know the thread pass `thread_ts`; the gate
+  // falls back to channel-level opt-in or top-level otherwise.
+  try {
+    ctx.assertOutboundAllowed(channel, args.thread_ts)
+  } catch (outboundErr) {
+    ctx.journalWrite({
+      kind: 'gate.outbound.deny',
+      outcome: 'deny',
+      toolName: 'download_attachment',
+      sessionKey: args.thread_ts !== undefined ? { channel, thread: args.thread_ts } : undefined,
+      input: { channel, thread_ts: args.thread_ts },
+      reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+    })
+    throw outboundErr
+  }
+  ctx.journalWrite({
+    kind: 'gate.outbound.allow',
+    outcome: 'allow',
+    toolName: 'download_attachment',
+    sessionKey: args.thread_ts !== undefined ? { channel, thread: args.thread_ts } : undefined,
+    input: { channel, thread_ts: args.thread_ts },
+  })
+
+  // Fetch the specific message to get file info
+  const res = await ctx.web.conversations.replies({
+    channel,
+    ts: messageTs,
+    limit: 1,
+    inclusive: true,
+  })
+
+  const msg = res.messages?.[0]
+  if (!msg?.files?.length) {
+    return { content: [{ type: 'text', text: 'No files found on that message.' }] }
+  }
+
+  const paths: string[] = []
+  for (const file of msg.files) {
+    const url = file.url_private_download || file.url_private
+    if (!url) continue
+
+    // Validate that the URL host is exactly files.slack.com over https
+    // before we attach the bot token. Slack's file URLs always live on
+    // that host; anything else is either Slack API tampering or a
+    // crafted file entry trying to exfil the token to an
+    // attacker-controlled endpoint.
+    if (!isSlackFileUrl(url)) continue
+
+    const safeName = sanitizeFilename(file.name || `file_${Date.now()}`)
+    const outPath = join(ctx.INBOX_DIR, `${messageTs.replace('.', '_')}_${safeName}`)
+
+    const resp = await fetch(url, {
+      headers: { Authorization: `Bearer ${ctx.botToken}` },
+    })
+    if (!resp.ok) continue
+
+    const buffer = Buffer.from(await resp.arrayBuffer())
+    writeFileSync(outPath, buffer)
+    paths.push(outPath)
+  }
+
+  return {
+    content: [
+      {
+        type: 'text',
+        text: paths.length
+          ? `Downloaded ${paths.length} file(s):\n${paths.join('\n')}`
+          : 'Failed to download any files.',
+      },
+    ],
+  }
+}
+
+// -----------------------------------------------------------------------
+// list_sessions — introspection (ccsc-xa3.9)
+// -----------------------------------------------------------------------
+async function executeListSessions(
+  _args: Record<string, any>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  // Pure read from the state dir. Returns lifecycle metadata
+  // only — session bodies (data field) are deliberately excluded
+  // so the operator gets an inventory without exposing
+  // conversation content that could carry secrets. See
+  // lib.listSessions for the full contract and
+  // LIST_SESSIONS_MAX for the hard-cap behavior.
+  const summaries = libListSessions(ctx.STATE_DIR)
+  const truncated = summaries.length >= LIST_SESSIONS_MAX
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify(
+          {
+            count: summaries.length,
+            max: LIST_SESSIONS_MAX,
+            truncated,
+            sessions: summaries,
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+  }
+}
+
+// -----------------------------------------------------------------------
+// read_peer_manifests — Epic 31-A.2 (ccsc-s53.2)
+//
+// Design: 000-docs/bot-manifest-protocol.md §58-87. Returns validated
+// v1 manifests posted in `channel` as pinned messages or in the last
+// 50 messages. Malformed, invalid, or mis-versioned payloads are
+// silently dropped per §81 and the 31-A.13 epic — this is
+// *advertising*, not an API, so there is no per-message error channel.
+//
+// Size cap (40 KB per raw body) is a sibling bead (ccsc-s53.3); rate
+// limit + per-channel cache are ccsc-s53.5. Both layer on top of this
+// function without changing its signature.
+// -----------------------------------------------------------------------
+async function executeReadPeerManifests(
+  args: Record<string, any>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const channel: string = args.channel
+
+  // Reuse the outbound gate as the read-access check: a manifest read
+  // must not open a path into a channel that the bot does not already
+  // participate in. No new surface; just the existing opt-in list.
+  try {
+    ctx.assertOutboundAllowed(channel, undefined)
+  } catch (outboundErr) {
+    ctx.journalWrite({
+      kind: 'gate.outbound.deny',
+      outcome: 'deny',
+      toolName: 'read_peer_manifests',
+      input: { channel },
+      reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+    })
+    throw outboundErr
+  }
+  ctx.journalWrite({
+    kind: 'gate.outbound.allow',
+    outcome: 'allow',
+    toolName: 'read_peer_manifests',
+    input: { channel },
+  })
+
+  // Resolve manifests from the 5-minute per-channel cache (hit) or
+  // freshly from Slack (miss). Either way, both paths converge on a
+  // single journal write + return below so the serialization and
+  // event-emission contract stay identical. Doc §84, §165.
+  const cached = ctx.manifestCache.get(channel)
+  let manifests: ReadonlyArray<import('./manifest.ts').ManifestV1>
+  let manifestEventKind: 'manifest.read' | 'manifest.read.cached'
+  if (cached !== undefined) {
+    manifests = cached
+    manifestEventKind = 'manifest.read.cached'
+  } else {
+    // Cache miss: fetch candidate message bodies from both sources
+    // the doc specifies (§79). Pin errors and history errors do not
+    // fail the tool — a peer that has pinned a valid manifest should
+    // surface even if the history call hiccups, and vice versa.
+    // Parallelised via allSettled so the tool's latency is
+    // max(pins, history) rather than pins + history.
+    const [pinsResult, historyResult] = await Promise.allSettled([
+      ctx.web.pins.list({ channel }),
+      ctx.web.conversations.history({ channel, limit: 50 }),
+    ])
+
+    const texts: Array<string | null | undefined> = []
+    if (pinsResult.status === 'fulfilled') {
+      for (const item of pinsResult.value.items ?? []) {
+        // pins.list returns {type: 'message', message: {...}} among
+        // other item kinds; only message items can carry manifests.
+        const msg = (item as { message?: { text?: string | null } }).message
+        if (msg) texts.push(msg.text ?? null)
+      }
+    }
+    if (historyResult.status === 'fulfilled') {
+      for (const msg of historyResult.value.messages ?? []) {
+        texts.push((msg as { text?: string | null }).text ?? null)
+      }
+    }
+
+    manifests = extractManifests(texts)
+    ctx.manifestCache.set(channel, manifests)
+    manifestEventKind = 'manifest.read'
+  }
+
+  ctx.journalWrite({
+    kind: manifestEventKind,
+    toolName: 'read_peer_manifests',
+    input: { channel, count: manifests.length },
+  })
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({ channel, count: manifests.length, manifests }, null, 2),
+      },
+    ],
+  }
+}
+
+// -----------------------------------------------------------------------
+// publish_manifest — Epic 31-B.1 + 31-B.3 (ccsc-0qk.1, ccsc-0qk.3)
+//
+// Post this bot's manifest into a Slack channel with "replace"
+// semantics: before posting, unpin any prior manifest this bot
+// published in the same channel, so at most one pinned manifest from
+// us exists per channel. Flow per the bead: pins.list → filter to
+// our own prior manifests → unpin each → chat.postMessage → pins.add.
+//
+// Two gates run before any Slack side effects:
+//
+//   1. assertPublishAllowed(caller_user_id, access) — only humans in
+//      access.allowFrom may authorise a publish (ccsc-0qk.5).
+//   2. assertOutboundAllowed(channel, undefined) — channel must be
+//      opted-in, same gate used for reply/read_peer_manifests.
+//
+// The manifest body itself is already Zod-validated by toolSchemas
+// (PublishManifestInput) before the handler is entered, so
+// oversized fields, wrong types, and missing magic header are all
+// caught pre-dispatch.
+//
+// Size cap (8 KB, stricter than read's 40 KB) and the 1-publish-per-
+// channel-per-hour rate limit are sibling beads (ccsc-0qk.2,
+// ccsc-0qk.4); they layer on without changing this surface.
+// -----------------------------------------------------------------------
+async function executePublishManifest(
+  args: Record<string, any>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  // Re-parse with the tool's own schema so TypeScript sees proper
+  // types for the rest of the handler instead of the dispatcher's
+  // `Record<string, any>`. The top-level safeParse at dispatch has
+  // already validated shape; this second parse is essentially a
+  // typed destructure and will not throw on reachable input.
+  const { channel, caller_user_id: callerUserId, manifest } = PublishManifestInput.parse(args)
+
+  // Gate 1: only allowlisted humans may publish.
+  executePublishManifestGate1(channel, callerUserId, ctx)
+
+  // Gate 2: channel must be opted in, same as any outbound write.
+  executePublishManifestGate2(channel, callerUserId, ctx)
+
+  ctx.journalWrite({
+    kind: 'gate.outbound.allow',
+    outcome: 'allow',
+    toolName: 'publish_manifest',
+    input: { channel, caller_user_id: callerUserId },
+  })
+
+  // Gate 3 (ccsc-0qk.2): 8 KB serialized-body cap. Runs after the
+  // auth gates so an unauthorised caller gets the auth error, not
+  // a size error (no info leak about payload contents). Serialize
+  // once here and reuse the string below so the bytes we measured
+  // are exactly the bytes that go on the wire.
+  const serialized = executePublishManifestGate3(channel, callerUserId, manifest, ctx)
+
+  // Gate 4 (ccsc-0qk.4): per-channel 1-per-hour rate limit. Last
+  // gate before any Slack round-trip, so an in-cooldown caller gets
+  // the rate-limit error without consuming any Slack API budget.
+  // The reservation is recorded here; if a downstream step fails,
+  // the slot is still taken — a retry-on-failure path would make
+  // the limiter trivially bypassable.
+  executePublishManifestGate4(channel, callerUserId, ctx)
+
+  // Replace semantics: unpin any prior manifest this bot posted in
+  // this channel before posting the new one. Best-effort — if the
+  // pins.list or a pins.remove fails, log and continue so a flaky
+  // Slack call doesn't break the publish. Worst case, the channel
+  // accumulates an extra pinned manifest from us; a subsequent
+  // publish will sweep it up.
+  const replaced = await executePublishManifestReplace(channel, ctx)
+
+  // Post + pin. If either fails the whole publish fails — a posted-
+  // but-unpinned manifest would be invisible to read_peer_manifests
+  // consumers anyway (they default to pins + last 50 messages, so
+  // the post would eventually surface via history, but the replace-
+  // semantics contract is pinned-message only). Fail loud here.
+  const postRes = await ctx.web.chat.postMessage({
+    channel,
+    text: serialized,
+    unfurl_links: false,
+    unfurl_media: false,
+  })
+  const ts = postRes.ts || ''
+  if (!ts) {
+    throw new Error('publish_manifest: chat.postMessage returned no ts')
+  }
+  await ctx.web.pins.add({ channel, timestamp: ts })
+
+  ctx.journalWrite({
+    kind: 'manifest.publish',
+    toolName: 'publish_manifest',
+    input: { channel, caller_user_id: callerUserId, replaced },
+  })
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({ channel, ts, replaced }, null, 2),
+      },
+    ],
+  }
+}
+
+/** Gate 1 for publish_manifest: only allowlisted humans may publish.
+ *  Throws (and journals) on rejection. */
+function executePublishManifestGate1(
+  channel: string,
+  callerUserId: string,
+  ctx: ToolContext,
+): void {
+  try {
+    assertPublishAllowed(callerUserId, ctx.getAccess())
+  } catch (publishErr) {
+    ctx.journalWrite({
+      kind: 'gate.outbound.deny',
+      outcome: 'deny',
+      toolName: 'publish_manifest',
+      input: { channel, caller_user_id: callerUserId },
+      reason: publishErr instanceof Error ? publishErr.message : String(publishErr),
+    })
+    throw publishErr
+  }
+}
+
+/** Gate 2 for publish_manifest: channel must be opted in.
+ *  Throws (and journals) on rejection. */
+function executePublishManifestGate2(
+  channel: string,
+  callerUserId: string,
+  ctx: ToolContext,
+): void {
+  try {
+    ctx.assertOutboundAllowed(channel, undefined)
+  } catch (outboundErr) {
+    ctx.journalWrite({
+      kind: 'gate.outbound.deny',
+      outcome: 'deny',
+      toolName: 'publish_manifest',
+      input: { channel, caller_user_id: callerUserId },
+      reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+    })
+    throw outboundErr
+  }
+}
+
+/** Gate 3 for publish_manifest: 8 KB serialized-body cap.
+ *  Returns the serialized manifest string on success; throws (and journals) on rejection. */
+function executePublishManifestGate3(
+  channel: string,
+  callerUserId: string,
+  manifest: import('./manifest.ts').ManifestV1,
+  ctx: ToolContext,
+): string {
+  try {
+    return assertPublishSizeAndSerialize(manifest)
+  } catch (sizeErr) {
+    ctx.journalWrite({
+      kind: 'gate.outbound.deny',
+      outcome: 'deny',
+      toolName: 'publish_manifest',
+      input: { channel, caller_user_id: callerUserId },
+      reason: sizeErr instanceof Error ? sizeErr.message : String(sizeErr),
+    })
+    throw sizeErr
+  }
+}
+
+/** Gate 4 for publish_manifest: per-channel 1-per-hour rate limit.
+ *  Throws (and journals) on rejection. */
+function executePublishManifestGate4(
+  channel: string,
+  callerUserId: string,
+  ctx: ToolContext,
+): void {
+  try {
+    ctx.publishRateLimiter.checkAndRecord(channel)
+  } catch (rateErr) {
+    ctx.journalWrite({
+      kind: 'gate.outbound.deny',
+      outcome: 'deny',
+      toolName: 'publish_manifest',
+      input: { channel, caller_user_id: callerUserId },
+      reason: rateErr instanceof Error ? rateErr.message : String(rateErr),
+    })
+    throw rateErr
+  }
+}
+
+/** Replace step for publish_manifest: unpin any prior manifest this bot
+ *  posted in the channel. Best-effort — failures are logged and swallowed.
+ *  Returns the count of pins removed. */
+async function executePublishManifestReplace(channel: string, ctx: ToolContext): Promise<number> {
+  let replaced = 0
+  try {
+    const pins = await ctx.web.pins.list({ channel })
+    const priorTs = findOurPriorManifestPins((pins.items ?? []) as ReadonlyArray<PinItemLike>, {
+      botId: ctx.selfBotId,
+      botUserId: ctx.botUserId,
+    })
+    for (const ts of priorTs) {
+      try {
+        await ctx.web.pins.remove({ channel, timestamp: ts })
+        replaced += 1
+      } catch (unpinErr) {
+        console.warn('[publish_manifest] pins.remove failed — continuing', {
+          channel,
+          ts,
+          error: unpinErr instanceof Error ? unpinErr.message : String(unpinErr),
+        })
+      }
+    }
+  } catch (pinsListErr) {
+    console.warn('[publish_manifest] pins.list failed — skipping replace sweep', {
+      channel,
+      error: pinsListErr instanceof Error ? pinsListErr.message : String(pinsListErr),
+    })
+  }
+  return replaced
+}
+
+// ---------------------------------------------------------------------------
+// Tool handler registry + dispatcher
+// ---------------------------------------------------------------------------
+
+type ToolHandler = (args: Record<string, any>, ctx: ToolContext) => Promise<ToolResult>
+
+const toolHandlers: Record<string, ToolHandler> = {
+  reply: executeReply,
+  react: executeReact,
+  edit_message: executeEditMessage,
+  fetch_messages: executeFetchMessages,
+  download_attachment: executeDownloadAttachment,
+  list_sessions: executeListSessions,
+  read_peer_manifests: executeReadPeerManifests,
+  publish_manifest: executePublishManifest,
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name } = request.params
   let args = (request.params.arguments || {}) as Record<string, any>
@@ -862,630 +1582,34 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     args = result.data as Record<string, any>
   } else {
-    // Tool exists in the switch but not in toolSchemas — reviewer oversight.
+    // Tool exists in the registry but not in toolSchemas — reviewer oversight.
     // Log a warning so it surfaces in operator logs.
     console.warn(`[mcp] tool "${name}" has no input schema; skipping validation`)
   }
 
-  switch (name) {
-    // -----------------------------------------------------------------------
-    // reply
-    // -----------------------------------------------------------------------
-    case 'reply': {
-      const chatId: string = args.chat_id
-      const text: string = args.text
-      const threadTs: string | undefined = args.thread_ts
-      const files: string[] | undefined = args.files
-
-      try {
-        assertOutboundAllowed(chatId, threadTs)
-      } catch (outboundErr) {
-        journalWrite({
-          kind: 'gate.outbound.deny',
-          outcome: 'deny',
-          toolName: 'reply',
-          sessionKey: threadTs !== undefined ? { channel: chatId, thread: threadTs } : undefined,
-          input: { channel: chatId, thread_ts: threadTs },
-          reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
-        })
-        throw outboundErr
-      }
-      journalWrite({
-        kind: 'gate.outbound.allow',
-        outcome: 'allow',
-        toolName: 'reply',
-        sessionKey: threadTs !== undefined ? { channel: chatId, thread: threadTs } : undefined,
-        input: { channel: chatId, thread_ts: threadTs },
-      })
-
-      const access = getAccess()
-      const limit = access.textChunkLimit || DEFAULT_CHUNK_LIMIT
-      const mode = access.chunkMode || 'newline'
-      const chunks = chunkText(text, limit, mode)
-
-      let lastTs = ''
-      for (const chunk of chunks) {
-        const res = await web.chat.postMessage({
-          channel: chatId,
-          text: chunk,
-          thread_ts: threadTs,
-          unfurl_links: false,
-          unfurl_media: false,
-        })
-        lastTs = (res.ts as string) || lastTs
-      }
-
-      // Upload files if provided
-      if (files && files.length > 0) {
-        for (const filePath of files) {
-          try {
-            assertSendable(filePath)
-          } catch (exfilErr) {
-            journalWrite({
-              kind: 'exfil.block',
-              outcome: 'deny',
-              toolName: 'reply',
-              reason: exfilErr instanceof Error ? exfilErr.message : String(exfilErr),
-            })
-            throw exfilErr
-          }
-          const resolved = resolve(filePath)
-          const uploadArgs: Record<string, any> = {
-            channel_id: chatId,
-            file: resolved,
-          }
-          if (threadTs) uploadArgs.thread_ts = threadTs
-          await web.filesUploadV2(uploadArgs as any)
-        }
-      }
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Sent ${chunks.length} message(s)${files?.length ? ` + ${files.length} file(s)` : ''} to ${chatId}${lastTs ? ` [ts: ${lastTs}]` : ''}`,
-          },
-        ],
-      }
+  const handler = toolHandlers[name]
+  if (handler) {
+    const ctx: ToolContext = {
+      web,
+      botToken,
+      assertOutboundAllowed,
+      assertSendable,
+      journalWrite,
+      getAccess,
+      resolveUserName,
+      manifestCache,
+      publishRateLimiter,
+      selfBotId,
+      botUserId,
+      STATE_DIR,
+      INBOX_DIR,
+      DEFAULT_CHUNK_LIMIT,
     }
-
-    // -----------------------------------------------------------------------
-    // react
-    // -----------------------------------------------------------------------
-    case 'react': {
-      // react operates on a specific message ts; the "thread" it
-      // engages with is whatever thread that message lives in.
-      // Callers that know the parent thread pass `thread_ts`; when
-      // omitted, fall back to channel-level opt-in or top-level
-      // delivery by passing undefined.
-      try {
-        assertOutboundAllowed(args.chat_id, args.thread_ts)
-      } catch (outboundErr) {
-        journalWrite({
-          kind: 'gate.outbound.deny',
-          outcome: 'deny',
-          toolName: 'react',
-          sessionKey:
-            args.thread_ts !== undefined
-              ? { channel: args.chat_id, thread: args.thread_ts }
-              : undefined,
-          input: { channel: args.chat_id, thread_ts: args.thread_ts },
-          reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
-        })
-        throw outboundErr
-      }
-      journalWrite({
-        kind: 'gate.outbound.allow',
-        outcome: 'allow',
-        toolName: 'react',
-        sessionKey:
-          args.thread_ts !== undefined
-            ? { channel: args.chat_id, thread: args.thread_ts }
-            : undefined,
-        input: { channel: args.chat_id, thread_ts: args.thread_ts },
-      })
-      await web.reactions.add({
-        channel: args.chat_id,
-        timestamp: args.message_id,
-        name: args.emoji,
-      })
-      return {
-        content: [{ type: 'text', text: `Reacted :${args.emoji}: to ${args.message_id}` }],
-      }
-    }
-
-    // -----------------------------------------------------------------------
-    // edit_message
-    // -----------------------------------------------------------------------
-    case 'edit_message': {
-      // Editing a message engages with the thread that message lives
-      // in. Callers that know the thread pass `thread_ts`; otherwise
-      // the gate falls back to channel-level opt-in or top-level.
-      try {
-        assertOutboundAllowed(args.chat_id, args.thread_ts)
-      } catch (outboundErr) {
-        journalWrite({
-          kind: 'gate.outbound.deny',
-          outcome: 'deny',
-          toolName: 'edit_message',
-          sessionKey:
-            args.thread_ts !== undefined
-              ? { channel: args.chat_id, thread: args.thread_ts }
-              : undefined,
-          input: { channel: args.chat_id, thread_ts: args.thread_ts },
-          reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
-        })
-        throw outboundErr
-      }
-      journalWrite({
-        kind: 'gate.outbound.allow',
-        outcome: 'allow',
-        toolName: 'edit_message',
-        sessionKey:
-          args.thread_ts !== undefined
-            ? { channel: args.chat_id, thread: args.thread_ts }
-            : undefined,
-        input: { channel: args.chat_id, thread_ts: args.thread_ts },
-      })
-      await web.chat.update({
-        channel: args.chat_id,
-        ts: args.message_id,
-        text: args.text,
-      })
-      return {
-        content: [{ type: 'text', text: `Edited message ${args.message_id}` }],
-      }
-    }
-
-    // -----------------------------------------------------------------------
-    // fetch_messages
-    // -----------------------------------------------------------------------
-    case 'fetch_messages': {
-      const channel: string = args.channel
-      const threadTs: string | undefined = args.thread_ts
-      const limit = Math.min(args.limit || 20, 100)
-      try {
-        assertOutboundAllowed(channel, threadTs)
-      } catch (outboundErr) {
-        journalWrite({
-          kind: 'gate.outbound.deny',
-          outcome: 'deny',
-          toolName: 'fetch_messages',
-          sessionKey: threadTs !== undefined ? { channel, thread: threadTs } : undefined,
-          input: { channel, thread_ts: threadTs },
-          reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
-        })
-        throw outboundErr
-      }
-      journalWrite({
-        kind: 'gate.outbound.allow',
-        outcome: 'allow',
-        toolName: 'fetch_messages',
-        sessionKey: threadTs !== undefined ? { channel, thread: threadTs } : undefined,
-        input: { channel, thread_ts: threadTs },
-      })
-
-      let messages: any[]
-      if (threadTs) {
-        const res = await web.conversations.replies({
-          channel,
-          ts: threadTs,
-          limit,
-        })
-        messages = res.messages || []
-      } else {
-        const res = await web.conversations.history({
-          channel,
-          limit,
-        })
-        messages = (res.messages || []).reverse() // oldest-first
-      }
-
-      const formatted = await Promise.all(
-        messages.map(async (m: any) => {
-          const userName = m.user ? await resolveUserName(m.user) : 'unknown'
-          return {
-            ts: m.ts,
-            user: userName,
-            user_id: m.user,
-            text: m.text,
-            thread_ts: m.thread_ts,
-            files: m.files?.map((f: any) => ({
-              name: f.name,
-              mimetype: f.mimetype,
-              size: f.size,
-            })),
-          }
-        }),
-      )
-
-      return {
-        content: [{ type: 'text', text: JSON.stringify(formatted, null, 2) }],
-      }
-    }
-
-    // -----------------------------------------------------------------------
-    // download_attachment
-    // -----------------------------------------------------------------------
-    case 'download_attachment': {
-      const channel: string = args.chat_id
-      const messageTs: string = args.message_id
-
-      // Download engages with the thread the target message lives
-      // in. Callers that know the thread pass `thread_ts`; the gate
-      // falls back to channel-level opt-in or top-level otherwise.
-      try {
-        assertOutboundAllowed(channel, args.thread_ts)
-      } catch (outboundErr) {
-        journalWrite({
-          kind: 'gate.outbound.deny',
-          outcome: 'deny',
-          toolName: 'download_attachment',
-          sessionKey:
-            args.thread_ts !== undefined ? { channel, thread: args.thread_ts } : undefined,
-          input: { channel, thread_ts: args.thread_ts },
-          reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
-        })
-        throw outboundErr
-      }
-      journalWrite({
-        kind: 'gate.outbound.allow',
-        outcome: 'allow',
-        toolName: 'download_attachment',
-        sessionKey: args.thread_ts !== undefined ? { channel, thread: args.thread_ts } : undefined,
-        input: { channel, thread_ts: args.thread_ts },
-      })
-
-      // Fetch the specific message to get file info
-      const res = await web.conversations.replies({
-        channel,
-        ts: messageTs,
-        limit: 1,
-        inclusive: true,
-      })
-
-      const msg = res.messages?.[0]
-      if (!msg?.files?.length) {
-        return { content: [{ type: 'text', text: 'No files found on that message.' }] }
-      }
-
-      const paths: string[] = []
-      for (const file of msg.files) {
-        const url = file.url_private_download || file.url_private
-        if (!url) continue
-
-        // Validate that the URL host is exactly files.slack.com over https
-        // before we attach the bot token. Slack's file URLs always live on
-        // that host; anything else is either Slack API tampering or a
-        // crafted file entry trying to exfil the token to an
-        // attacker-controlled endpoint.
-        if (!isSlackFileUrl(url)) continue
-
-        const safeName = sanitizeFilename(file.name || `file_${Date.now()}`)
-        const outPath = join(INBOX_DIR, `${messageTs.replace('.', '_')}_${safeName}`)
-
-        const resp = await fetch(url, {
-          headers: { Authorization: `Bearer ${botToken}` },
-        })
-        if (!resp.ok) continue
-
-        const buffer = Buffer.from(await resp.arrayBuffer())
-        writeFileSync(outPath, buffer)
-        paths.push(outPath)
-      }
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: paths.length
-              ? `Downloaded ${paths.length} file(s):\n${paths.join('\n')}`
-              : 'Failed to download any files.',
-          },
-        ],
-      }
-    }
-
-    // -----------------------------------------------------------------------
-    // list_sessions — introspection (ccsc-xa3.9)
-    // -----------------------------------------------------------------------
-    case 'list_sessions': {
-      // Pure read from the state dir. Returns lifecycle metadata
-      // only — session bodies (data field) are deliberately excluded
-      // so the operator gets an inventory without exposing
-      // conversation content that could carry secrets. See
-      // lib.listSessions for the full contract and
-      // LIST_SESSIONS_MAX for the hard-cap behavior.
-      const summaries = libListSessions(STATE_DIR)
-      const truncated = summaries.length >= LIST_SESSIONS_MAX
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(
-              {
-                count: summaries.length,
-                max: LIST_SESSIONS_MAX,
-                truncated,
-                sessions: summaries,
-              },
-              null,
-              2,
-            ),
-          },
-        ],
-      }
-    }
-
-    // -----------------------------------------------------------------------
-    // read_peer_manifests — Epic 31-A.2 (ccsc-s53.2)
-    //
-    // Design: 000-docs/bot-manifest-protocol.md §58-87. Returns validated
-    // v1 manifests posted in `channel` as pinned messages or in the last
-    // 50 messages. Malformed, invalid, or mis-versioned payloads are
-    // silently dropped per §81 and the 31-A.13 epic — this is
-    // *advertising*, not an API, so there is no per-message error channel.
-    //
-    // Size cap (40 KB per raw body) is a sibling bead (ccsc-s53.3); rate
-    // limit + per-channel cache are ccsc-s53.5. Both layer on top of this
-    // function without changing its signature.
-    // -----------------------------------------------------------------------
-    case 'read_peer_manifests': {
-      const channel: string = args.channel
-
-      // Reuse the outbound gate as the read-access check: a manifest read
-      // must not open a path into a channel that the bot does not already
-      // participate in. No new surface; just the existing opt-in list.
-      try {
-        assertOutboundAllowed(channel, undefined)
-      } catch (outboundErr) {
-        journalWrite({
-          kind: 'gate.outbound.deny',
-          outcome: 'deny',
-          toolName: 'read_peer_manifests',
-          input: { channel },
-          reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
-        })
-        throw outboundErr
-      }
-      journalWrite({
-        kind: 'gate.outbound.allow',
-        outcome: 'allow',
-        toolName: 'read_peer_manifests',
-        input: { channel },
-      })
-
-      // Resolve manifests from the 5-minute per-channel cache (hit) or
-      // freshly from Slack (miss). Either way, both paths converge on a
-      // single journal write + return below so the serialization and
-      // event-emission contract stay identical. Doc §84, §165.
-      const cached = manifestCache.get(channel)
-      let manifests: ReadonlyArray<import('./manifest.ts').ManifestV1>
-      let manifestEventKind: 'manifest.read' | 'manifest.read.cached'
-      if (cached !== undefined) {
-        manifests = cached
-        manifestEventKind = 'manifest.read.cached'
-      } else {
-        // Cache miss: fetch candidate message bodies from both sources
-        // the doc specifies (§79). Pin errors and history errors do not
-        // fail the tool — a peer that has pinned a valid manifest should
-        // surface even if the history call hiccups, and vice versa.
-        // Parallelised via allSettled so the tool's latency is
-        // max(pins, history) rather than pins + history.
-        const [pinsResult, historyResult] = await Promise.allSettled([
-          web.pins.list({ channel }),
-          web.conversations.history({ channel, limit: 50 }),
-        ])
-
-        const texts: Array<string | null | undefined> = []
-        if (pinsResult.status === 'fulfilled') {
-          for (const item of pinsResult.value.items ?? []) {
-            // pins.list returns {type: 'message', message: {...}} among
-            // other item kinds; only message items can carry manifests.
-            const msg = (item as { message?: { text?: string | null } }).message
-            if (msg) texts.push(msg.text ?? null)
-          }
-        }
-        if (historyResult.status === 'fulfilled') {
-          for (const msg of historyResult.value.messages ?? []) {
-            texts.push((msg as { text?: string | null }).text ?? null)
-          }
-        }
-
-        manifests = extractManifests(texts)
-        manifestCache.set(channel, manifests)
-        manifestEventKind = 'manifest.read'
-      }
-
-      journalWrite({
-        kind: manifestEventKind,
-        toolName: 'read_peer_manifests',
-        input: { channel, count: manifests.length },
-      })
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ channel, count: manifests.length, manifests }, null, 2),
-          },
-        ],
-      }
-    }
-
-    // -----------------------------------------------------------------------
-    // publish_manifest — Epic 31-B.1 + 31-B.3 (ccsc-0qk.1, ccsc-0qk.3)
-    //
-    // Post this bot's manifest into a Slack channel with "replace"
-    // semantics: before posting, unpin any prior manifest this bot
-    // published in the same channel, so at most one pinned manifest from
-    // us exists per channel. Flow per the bead: pins.list → filter to
-    // our own prior manifests → unpin each → chat.postMessage → pins.add.
-    //
-    // Two gates run before any Slack side effects:
-    //
-    //   1. assertPublishAllowed(caller_user_id, access) — only humans in
-    //      access.allowFrom may authorise a publish (ccsc-0qk.5).
-    //   2. assertOutboundAllowed(channel, undefined) — channel must be
-    //      opted-in, same gate used for reply/read_peer_manifests.
-    //
-    // The manifest body itself is already Zod-validated by toolSchemas
-    // (PublishManifestInput) before the handler is entered, so
-    // oversized fields, wrong types, and missing magic header are all
-    // caught pre-dispatch.
-    //
-    // Size cap (8 KB, stricter than read's 40 KB) and the 1-publish-per-
-    // channel-per-hour rate limit are sibling beads (ccsc-0qk.2,
-    // ccsc-0qk.4); they layer on without changing this surface.
-    // -----------------------------------------------------------------------
-    case 'publish_manifest': {
-      // Re-parse with the tool's own schema so TypeScript sees proper
-      // types for the rest of the handler instead of the dispatcher's
-      // `Record<string, any>`. The top-level safeParse at dispatch has
-      // already validated shape; this second parse is essentially a
-      // typed destructure and will not throw on reachable input.
-      const { channel, caller_user_id: callerUserId, manifest } = PublishManifestInput.parse(args)
-
-      // Gate 1: only allowlisted humans may publish.
-      try {
-        assertPublishAllowed(callerUserId, getAccess())
-      } catch (publishErr) {
-        journalWrite({
-          kind: 'gate.outbound.deny',
-          outcome: 'deny',
-          toolName: 'publish_manifest',
-          input: { channel, caller_user_id: callerUserId },
-          reason: publishErr instanceof Error ? publishErr.message : String(publishErr),
-        })
-        throw publishErr
-      }
-
-      // Gate 2: channel must be opted in, same as any outbound write.
-      try {
-        assertOutboundAllowed(channel, undefined)
-      } catch (outboundErr) {
-        journalWrite({
-          kind: 'gate.outbound.deny',
-          outcome: 'deny',
-          toolName: 'publish_manifest',
-          input: { channel, caller_user_id: callerUserId },
-          reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
-        })
-        throw outboundErr
-      }
-      journalWrite({
-        kind: 'gate.outbound.allow',
-        outcome: 'allow',
-        toolName: 'publish_manifest',
-        input: { channel, caller_user_id: callerUserId },
-      })
-
-      // Gate 3 (ccsc-0qk.2): 8 KB serialized-body cap. Runs after the
-      // auth gates so an unauthorised caller gets the auth error, not
-      // a size error (no info leak about payload contents). Serialize
-      // once here and reuse the string below so the bytes we measured
-      // are exactly the bytes that go on the wire.
-      let serialized: string
-      try {
-        serialized = assertPublishSizeAndSerialize(manifest)
-      } catch (sizeErr) {
-        journalWrite({
-          kind: 'gate.outbound.deny',
-          outcome: 'deny',
-          toolName: 'publish_manifest',
-          input: { channel, caller_user_id: callerUserId },
-          reason: sizeErr instanceof Error ? sizeErr.message : String(sizeErr),
-        })
-        throw sizeErr
-      }
-
-      // Gate 4 (ccsc-0qk.4): per-channel 1-per-hour rate limit. Last
-      // gate before any Slack round-trip, so an in-cooldown caller gets
-      // the rate-limit error without consuming any Slack API budget.
-      // The reservation is recorded here; if a downstream step fails,
-      // the slot is still taken — a retry-on-failure path would make
-      // the limiter trivially bypassable.
-      try {
-        publishRateLimiter.checkAndRecord(channel)
-      } catch (rateErr) {
-        journalWrite({
-          kind: 'gate.outbound.deny',
-          outcome: 'deny',
-          toolName: 'publish_manifest',
-          input: { channel, caller_user_id: callerUserId },
-          reason: rateErr instanceof Error ? rateErr.message : String(rateErr),
-        })
-        throw rateErr
-      }
-
-      // Replace semantics: unpin any prior manifest this bot posted in
-      // this channel before posting the new one. Best-effort — if the
-      // pins.list or a pins.remove fails, log and continue so a flaky
-      // Slack call doesn't break the publish. Worst case, the channel
-      // accumulates an extra pinned manifest from us; a subsequent
-      // publish will sweep it up.
-      let replaced = 0
-      try {
-        const pins = await web.pins.list({ channel })
-        const priorTs = findOurPriorManifestPins((pins.items ?? []) as ReadonlyArray<PinItemLike>, {
-          botId: selfBotId,
-          botUserId,
-        })
-        for (const ts of priorTs) {
-          try {
-            await web.pins.remove({ channel, timestamp: ts })
-            replaced += 1
-          } catch (unpinErr) {
-            console.warn('[publish_manifest] pins.remove failed — continuing', {
-              channel,
-              ts,
-              error: unpinErr instanceof Error ? unpinErr.message : String(unpinErr),
-            })
-          }
-        }
-      } catch (pinsListErr) {
-        console.warn('[publish_manifest] pins.list failed — skipping replace sweep', {
-          channel,
-          error: pinsListErr instanceof Error ? pinsListErr.message : String(pinsListErr),
-        })
-      }
-
-      // Post + pin. If either fails the whole publish fails — a posted-
-      // but-unpinned manifest would be invisible to read_peer_manifests
-      // consumers anyway (they default to pins + last 50 messages, so
-      // the post would eventually surface via history, but the replace-
-      // semantics contract is pinned-message only). Fail loud here.
-      const postRes = await web.chat.postMessage({
-        channel,
-        text: serialized,
-        unfurl_links: false,
-        unfurl_media: false,
-      })
-      const ts = postRes.ts || ''
-      if (!ts) {
-        throw new Error('publish_manifest: chat.postMessage returned no ts')
-      }
-      await web.pins.add({ channel, timestamp: ts })
-
-      journalWrite({
-        kind: 'manifest.publish',
-        toolName: 'publish_manifest',
-        input: { channel, caller_user_id: callerUserId, replaced },
-      })
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ channel, ts, replaced }, null, 2),
-          },
-        ],
-      }
-    }
-
-    default:
-      return {
-        content: [{ type: 'text', text: `Unknown tool: ${name}` }],
-        isError: true,
-      }
+    return handler(args, ctx)
+  }
+  return {
+    content: [{ type: 'text', text: `Unknown tool: ${name}` }],
+    isError: true,
   }
 })
 
