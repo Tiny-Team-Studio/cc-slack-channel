@@ -78,11 +78,16 @@
 {"issue_id":"ccsc-60i","label":"release:v0.5.1"}
 {"issue_id":"ccsc-67u","label":"release:v0.5.1"}
 {"issue_id":"ccsc-6j2","label":"release:v0.5.1"}
+{"issue_id":"ccsc-71v","label":"audit-integrity"}
 {"issue_id":"ccsc-7e1","label":"release:v0.5.1"}
 {"issue_id":"ccsc-80a","label":"release:v0.5.1"}
+{"issue_id":"ccsc-8g6","label":"audit-integrity"}
+{"issue_id":"ccsc-8g6","label":"security"}
 {"issue_id":"ccsc-9d9","label":"release:v0.5.1"}
 {"issue_id":"ccsc-a9z","label":"hardening"}
 {"issue_id":"ccsc-a9z","label":"security"}
+{"issue_id":"ccsc-bsz","label":"audit-integrity"}
+{"issue_id":"ccsc-bsz","label":"security"}
 {"issue_id":"ccsc-buo","label":"release:v0.5.1"}
 {"issue_id":"ccsc-bz1","label":"release:v0.5.1"}
 {"issue_id":"ccsc-cfp","label":"release:v0.5.1"}
@@ -125,6 +130,11 @@
 {"issue_id":"ccsc-dhh.9","label":"issue:#30"}
 {"issue_id":"ccsc-dhh.9","label":"release:v0.5.1"}
 {"issue_id":"ccsc-dxz","label":"release:v0.5.1"}
+{"issue_id":"ccsc-g1d","label":"audit-integrity"}
+{"issue_id":"ccsc-g1d","label":"upstream"}
+{"issue_id":"ccsc-gh0","label":"audit-integrity"}
+{"issue_id":"ccsc-gh0","label":"wall5"}
+{"issue_id":"ccsc-gh0","label":"wall6"}
 {"issue_id":"ccsc-hmj","label":"phase:p0-prereq"}
 {"issue_id":"ccsc-hmj","label":"release:v0.4.1"}
 {"issue_id":"ccsc-jqs","label":"release:v0.5.1"}
@@ -133,6 +143,8 @@
 {"issue_id":"ccsc-ksm","label":"phase:p0-prereq"}
 {"issue_id":"ccsc-ksm","label":"release:v0.5.0"}
 {"issue_id":"ccsc-kya","label":"release:v0.5.1"}
+{"issue_id":"ccsc-l5z","label":"audit-integrity"}
+{"issue_id":"ccsc-l5z","label":"mutation-testing"}
 {"issue_id":"ccsc-me6","label":"issue:#29"}
 {"issue_id":"ccsc-me6","label":"release:v0.6.0"}
 {"issue_id":"ccsc-me6.1","label":"issue:#29"}
@@ -167,6 +179,8 @@
 {"issue_id":"ccsc-me6.8","label":"release:v0.6.0"}
 {"issue_id":"ccsc-me6.9","label":"issue:#29"}
 {"issue_id":"ccsc-me6.9","label":"release:v0.6.0"}
+{"issue_id":"ccsc-mjw","label":"audit-integrity"}
+{"issue_id":"ccsc-mjw","label":"wall1"}
 {"issue_id":"ccsc-nes","label":"release:v0.5.1"}
 {"issue_id":"ccsc-nlr","label":"phase:p0-prereq"}
 {"issue_id":"ccsc-nlr","label":"release:v0.5.0"}
@@ -174,6 +188,7 @@
 {"issue_id":"ccsc-npd","label":"release:v0.6.0"}
 {"issue_id":"ccsc-p26","label":"release:v0.5.1"}
 {"issue_id":"ccsc-rc1","label":"release:v0.6.1"}
+{"issue_id":"ccsc-s10","label":"audit-integrity"}
 {"issue_id":"ccsc-s53","label":"issue:#31"}
 {"issue_id":"ccsc-s53","label":"release:v0.7.0"}
 {"issue_id":"ccsc-s53.1","label":"issue:#31"}
@@ -206,6 +221,7 @@
 {"issue_id":"ccsc-s53.9","label":"release:v0.7.0"}
 {"issue_id":"ccsc-t7j","label":"issue:#30"}
 {"issue_id":"ccsc-t7j","label":"release:v0.5.1"}
+{"issue_id":"ccsc-tr7","label":"audit-integrity"}
 {"issue_id":"ccsc-v1b","label":"issue:#29"}
 {"issue_id":"ccsc-v1b","label":"release:v0.5.0"}
 {"issue_id":"ccsc-v1b.1","label":"issue:#29"}
@@ -270,6 +286,8 @@
 {"issue_id":"ccsc-xa3.9","label":"release:v0.5.0"}
 {"issue_id":"ccsc-xfj","label":"phase:p0-prereq"}
 {"issue_id":"ccsc-xfj","label":"release:v0.5.0"}
+{"issue_id":"ccsc-y4e","label":"audit-integrity"}
+{"issue_id":"ccsc-y4e","label":"security"}
 {"issue_id":"ccsc-z09","label":"release:v0.5.1"}
 {"issue_id":"ccsc-z78","label":"issue:#32"}
 {"issue_id":"ccsc-z78","label":"release:v0.5.0"}
