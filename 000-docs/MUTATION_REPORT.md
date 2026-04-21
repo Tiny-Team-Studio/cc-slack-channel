@@ -28,16 +28,31 @@ mutation-testing gap so severe that the baseline should be treated as a draft.
 
 ## Scope (and why it's narrow)
 
-Baseline run covered **`lib.ts` only** (1,770 lines, 913 mutants generated).
-`policy.ts` and `manifest.ts` are out of scope for this first run. The initial
-attempt over all three files (1,427 mutants) projected ~24 min on this hardware
-— over the 20-min budget set for the PR — so the config was narrowed. Opening
-the scope to `policy.ts` and `manifest.ts` is a reasonable follow-up once
-either (a) CI-free hardware is faster or (b) Stryker is wired to run the tests
-via a warm `bun test` runner rather than cold-spawning `bun test` per mutant.
+**Original baseline** (ccsc-ao9) covered **`lib.ts` only** (1,770 lines, 913 mutants) because the full-scope run projected ~24 min on this hardware — over the 20-min budget the PR had set.
 
-`server.ts`, `supervisor.ts`, and `journal.ts` were excluded by design:
-boot-time side effects and module-load globals confuse the mutator.
+**Expanded scope** (ccsc-l5z, this change): `stryker.conf.mjs` now mutates `lib.ts` + `policy.ts` + `manifest.ts` + `journal.ts` — the four security-critical pure modules. Observed mutant count on the expanded scope: **1 860** (up from 913), with an expected ~45-minute runtime on this workstation at `concurrency: 4`.
+
+`server.ts` and `supervisor.ts` remain out of scope: `server.ts` has boot-time side effects and module-load globals that confuse the mutator; `supervisor.ts` mutants routinely time out under the command runner's cold-spawn overhead.
+
+### Per-file baselines (expanded scope — 2026-04-21)
+
+Full 42-minute run against the four-file scope after `ccsc-y4e`'s survivor-kill tests landed. Final numbers:
+
+| File | Mutants | Killed | Timed out | Survived | Score |
+|---|---|---|---|---|---|
+| `journal.ts` | 433 | 378 | 2 | 53 | **87.76%** |
+| `lib.ts` | 913 | 770 | 4 | 139 | **84.78%** |
+| `manifest.ts` | 214 | 197 | 0 | 17 | **92.06%** |
+| `policy.ts` | 300 | 233 | 1 | 66 | **78.00%** |
+| **All files** | **1 860** | **1 578** | **7** | **275** | **85.22%** |
+
+Overall **85.22%** — above the `high: 80` threshold in `stryker.conf.mjs`.
+
+`manifest.ts` leads at 92.06% — Epic 31-B's Zod schema + strict subset validation produces easily-killable mutants. `journal.ts` second at 87.76%. `lib.ts` at 84.78% matches the post-y4e intermediate run within noise. `policy.ts` is the outlier at 78.00% — below `high` but above `low: 60`. The surviving mutants cluster on error-string literals inside `detectShadowing` / `detectBroadAutoApprove` warnings — the behavior (warn on shadow / footgun) is fully exercised, but the exact warning text isn't asserted bit-for-bit.
+
+**Follow-up:** strengthening `policy.ts` warning-message assertions is a reasonable P3 follow-up — the primitive is exercised, the text isn't. Not urgent; the mutation score is above the `low` threshold and the behavior coverage is strong.
+
+Runtime: **42 minutes 43 seconds** at `concurrency: 4` on this workstation. HTML report written to `reports/mutation/mutation.html` (gitignored).
 
 ## Reproduce
 
