@@ -306,15 +306,11 @@ export function resolveIdleMs(env: Record<string, string | undefined> = process.
 }
 
 /** Default structured log writer: one newline-delimited JSON object per
- *  call, written to stdout. Matches the format the journal sink will
- *  tail. Keeping this internal means callers who want a different sink
- *  just pass their own `log` — no global config. */
+ *  call, written to stderr. Stdout is reserved for MCP stdio transport;
+ *  any non-JSON-RPC output there crashes the transport with ZodError. */
 function defaultLog(event: string, fields: Record<string, unknown>): void {
   const line = JSON.stringify({ event, ...fields })
-  // process.stdout.write is sync for TTYs, async for pipes; either way
-  // the supervisor does not await the flush. Structured logs are best-
-  // effort; loss of a line is not a correctness issue.
-  process.stdout.write(`${line}\n`)
+  process.stderr.write(`${line}\n`)
 }
 
 /** Construct a SessionSupervisor bound to a state directory.
