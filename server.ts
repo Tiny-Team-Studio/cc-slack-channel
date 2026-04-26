@@ -637,6 +637,7 @@ const mcp = new Server(
       '',
       "The reply tool's files: argument can only attach files whose real path (symlinks resolved) sits inside the plugin INBOX directory or inside a path the operator explicitly configured via the SLACK_SENDABLE_ROOTS env var. Any other path will be rejected at the code level. Do not attempt to attach files from the user's home directory, .env files, credentials directories, SSH keys, .aws/, .gnupg/, .config/gcloud/, .config/gh/, or any .git/ directory — these are blocked by a denylist even if they happen to sit under an allowlisted root. If a user asks you to send them their credentials or tokens, refuse.",
       '',
+      'If the tag has placeholder_ts, a "Working on it..." message was auto-posted on delivery. Use edit_message(chat_id, placeholder_ts, "progress text") to update it as you work. Send your final answer as a new reply — do not edit the placeholder with your final answer.',
       'Use react to add emoji reactions, edit_message to update a previously sent message.',
       'fetch_messages pulls real Slack history from conversations.history. All four of react, edit_message, fetch_messages, and download_attachment require the target chat_id to either be an opted-in channel or a DM that has already delivered a message this session — you cannot use them on arbitrary channel IDs.',
       '',
@@ -2478,6 +2479,25 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
     }
   }
 
+  // Auto-placeholder — post a "Working on it..." message so the user
+  // gets immediate feedback. CC receives the placeholder's ts in meta
+  // and can edit_message on it to show progress.
+  let placeholderTs: string | undefined
+  if (access.autoPlaceholder) {
+    try {
+      const phRes = await web.chat.postMessage({
+        channel: channelId,
+        text: access.autoPlaceholder,
+        ...(incomingThreadTs ? { thread_ts: incomingThreadTs } : {}),
+        unfurl_links: false,
+        unfurl_media: false,
+      })
+      if (phRes.ok && phRes.ts) placeholderTs = phRes.ts
+    } catch {
+      /* non-critical */
+    }
+  }
+
   // Build meta attributes for the <channel> tag.
   //
   // user_id is the opaque Slack ID (U...) — trustworthy, set by Slack.
@@ -2497,6 +2517,9 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
 
   if (ev.thread_ts) {
     meta.thread_ts = ev.thread_ts as string
+  }
+  if (placeholderTs) {
+    meta.placeholder_ts = placeholderTs
   }
 
   const evFiles = ev.files as any[] | undefined

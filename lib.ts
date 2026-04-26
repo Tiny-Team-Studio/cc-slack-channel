@@ -79,6 +79,7 @@ export interface Access {
   channels: Record<string, ChannelPolicy>
   pending: Record<string, PendingEntry>
   ackReaction?: string
+  autoPlaceholder?: string
   textChunkLimit?: number
   chunkMode?: 'length' | 'newline'
   /** Optional array of declarative policy rules, consumed by the
