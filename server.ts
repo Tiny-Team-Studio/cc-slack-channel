@@ -2486,15 +2486,14 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
     }
   }
 
-  // Auto-placeholder — post a "Working on it..." message so the user
-  // gets immediate feedback. CC receives the placeholder's ts in meta
-  // and can edit_message on it to show progress.
-  // Only fires when the message @mentions the bot — non-mentioned messages
-  // (in requireMention:false channels) are read silently without a placeholder.
-  const rawText = (ev.text as string) || ''
-  const wasMentioned = botUserId ? rawText.includes(`<@${botUserId}>`) : false
+  // Auto-placeholder — post the placeholder so the channel-progress hooks have
+  // a message to drive (live train-of-thought + guaranteed delivery).
+  // deliverEvent only runs for messages that already passed the requireMention
+  // gate, so firing on EVERY delivered message is correct: requireMention:false
+  // channels (Tim) get a bubble on every message (Telegram parity); a
+  // requireMention:true channel only reaches here when the bot is @mentioned.
   let placeholderTs: string | undefined
-  if (access.autoPlaceholder && wasMentioned) {
+  if (access.autoPlaceholder) {
     try {
       const phRes = await web.chat.postMessage({
         channel: channelId,
