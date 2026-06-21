@@ -1099,6 +1099,42 @@ export function sanitizeDisplayName(raw: unknown): string {
   return cleaned.length > 0 ? cleaned : 'unknown'
 }
 
+/**
+ * Matches a Slack user mention: `<@U…>` or `<@W…>`, with an optional
+ * `|fallback` label (the link form Slack sometimes sends). Capture group 1 is
+ * the bare user ID. Global so `matchAll`/`replace` walk every occurrence.
+ */
+export const USER_MENTION_RE = /<@([UW][A-Z0-9]+)(?:\|[^>]*)?>/g
+
+/**
+ * Replace residual `<@UID>` user mentions in inbound Slack text with
+ * `@DisplayName`. Slack delivers mentions as opaque IDs (`<@U0AV9F159L6> …`);
+ * without resolution a bot cannot tell "addressed to a teammate" from
+ * "addressed to me", and wrongly answers messages meant for someone else
+ * (e.g. Tim replying to a message James addressed to Katie — 2026-06-21).
+ *
+ * The bot's OWN mention is stripped upstream (server.ts) before this runs, so
+ * this only humanizes everyone else. `resolve` is injected (server passes the
+ * cached `resolveUserName`) to keep this pure and unit-testable; the names it
+ * returns are already sanitized. On an empty match set the text is returned
+ * untouched (no API calls).
+ */
+export async function humanizeMentions(
+  text: string,
+  resolve: (userId: string) => Promise<string>,
+): Promise<string> {
+  const ids = new Set<string>()
+  for (const m of text.matchAll(USER_MENTION_RE)) ids.add(m[1])
+  if (ids.size === 0) return text
+  const names = new Map<string, string>()
+  await Promise.all(
+    [...ids].map(async (id) => {
+      names.set(id, await resolve(id))
+    }),
+  )
+  return text.replace(USER_MENTION_RE, (_full, id: string) => `@${names.get(id) ?? id}`)
+}
+
 // ---------------------------------------------------------------------------
 // Gate function
 //

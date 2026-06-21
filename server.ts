@@ -39,6 +39,7 @@ import {
   escMrkdwn,
   formatVerifyResult,
   type GateResult,
+  humanizeMentions,
   isDuplicateEvent,
   isSlackFileUrl,
   LIST_SESSIONS_MAX,
@@ -2547,6 +2548,12 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
   if (botUserId) {
     text = text.replace(new RegExp(`<@${botUserId}>\\s*`, 'g'), '').trim()
   }
+
+  // Humanize remaining user mentions (<@UID> -> @DisplayName) so Claude can
+  // tell when a message is addressed to someone else (e.g. the other co-founder)
+  // and stay silent. Without this, a mention is an opaque ID Claude misreads as
+  // itself. The bot's own mention was already stripped above.
+  text = await humanizeMentions(text, resolveUserName)
 
   // Push into Claude Code session via MCP notification
   mcp.notification({

@@ -36,6 +36,7 @@ import {
   gate,
   generateCode,
   generateCorrelationId,
+  humanizeMentions,
   isDuplicateEvent,
   isSlackFileUrl,
   loadSession,
@@ -1307,6 +1308,53 @@ describe('sanitizeDisplayName', () => {
   test('preserves normal names unchanged', () => {
     expect(sanitizeDisplayName('Ian Maurer')).toBe('Ian Maurer')
     expect(sanitizeDisplayName('alice.bob-42')).toBe('alice.bob-42')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// humanizeMentions()
+// ---------------------------------------------------------------------------
+
+describe('humanizeMentions', () => {
+  // Resolver standing in for the cached resolveUserName.
+  const NAMES: Record<string, string> = {
+    U0AV9F159L6: 'Katie',
+    U0AV55R0WTV: 'James Milton',
+  }
+  const resolve = async (id: string) => NAMES[id] ?? id
+
+  test('resolves a single mention to @DisplayName (the Katie incident)', async () => {
+    const out = await humanizeMentions(
+      '<@U0AV9F159L6> By the way, I have forwarded you this email thread.',
+      resolve,
+    )
+    expect(out).toBe('@Katie By the way, I have forwarded you this email thread.')
+  })
+
+  test('resolves multiple distinct mentions', async () => {
+    const out = await humanizeMentions('<@U0AV55R0WTV> and <@U0AV9F159L6> should sync', resolve)
+    expect(out).toBe('@James Milton and @Katie should sync')
+  })
+
+  test('handles the <@UID|fallback> link form', async () => {
+    const out = await humanizeMentions('hey <@U0AV9F159L6|katie> ping', resolve)
+    expect(out).toBe('hey @Katie ping')
+  })
+
+  test('leaves text without mentions untouched (and makes no resolver calls)', async () => {
+    let calls = 0
+    const counting = async (id: string) => {
+      calls++
+      return id
+    }
+    const out = await humanizeMentions('plain message, no mentions', counting)
+    expect(out).toBe('plain message, no mentions')
+    expect(calls).toBe(0)
+  })
+
+  test('falls back to the id when the resolver cannot name it', async () => {
+    const out = await humanizeMentions('<@UNKNOWN123> hi', async (id) => id)
+    expect(out).toBe('@UNKNOWN123 hi')
   })
 })
 
